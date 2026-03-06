@@ -501,3 +501,303 @@ TEST_CASE("AVV2 Single-File Extraction APIs", "[vfs_core]") {
   std::filesystem::remove_all(test_dir);
   std::filesystem::remove(archive);
 }
+
+// ===========================================================================
+// Encryption and Integrity Tests
+// ===========================================================================
+
+TEST_CASE("XOR Encryption Roundtrip", "[vfs_core][crypto]") {
+  const std::filesystem::path test_dir = "crypto_xor_in";
+  const std::filesystem::path out_dir = "crypto_xor_out";
+  const std::filesystem::path archive = "crypto_xor.avv";
+
+  std::filesystem::remove_all(test_dir);
+  std::filesystem::remove_all(out_dir);
+  std::filesystem::remove(archive);
+  std::filesystem::create_directories(test_dir);
+
+  write_file(test_dir / "secret.txt", "Top secret XOR payload.");
+
+  EncryptionOptions enc;
+  enc.algorithm = EncryptionAlgorithm::Xor;
+  enc.key = "my_password";
+
+  ArchiveWriter writer;
+  REQUIRE(writer
+              .pack_directory(test_dir, archive, DEFAULT_COMPRESSION_LEVEL,
+                              nullptr, enc)
+              .has_value());
+
+  ArchiveReader reader;
+  REQUIRE(reader.open(archive).has_value());
+  REQUIRE(reader.unpack_all(out_dir, nullptr, "my_password").has_value());
+  CHECK(read_file(out_dir / "secret.txt") == "Top secret XOR payload.");
+
+  std::filesystem::remove_all(test_dir);
+  std::filesystem::remove_all(out_dir);
+  std::filesystem::remove(archive);
+}
+
+TEST_CASE("AES-256-CTR Encryption Roundtrip", "[vfs_core][crypto]") {
+  const std::filesystem::path test_dir = "crypto_aes_in";
+  const std::filesystem::path out_dir = "crypto_aes_out";
+  const std::filesystem::path archive = "crypto_aes.avv";
+
+  std::filesystem::remove_all(test_dir);
+  std::filesystem::remove_all(out_dir);
+  std::filesystem::remove(archive);
+  std::filesystem::create_directories(test_dir);
+
+  std::string secret = "Top secret AES payload.";
+  write_file(test_dir / "secret.txt", secret);
+
+  EncryptionOptions enc;
+  enc.algorithm = EncryptionAlgorithm::Aes256Ctr;
+  enc.key = "strong_password";
+
+  ArchiveWriter writer;
+  REQUIRE(writer
+              .pack_directory(test_dir, archive, DEFAULT_COMPRESSION_LEVEL,
+                              nullptr, enc)
+              .has_value());
+
+  std::string disk_bytes = read_file(archive);
+  CHECK(disk_bytes.find(secret) == std::string::npos);
+
+  ArchiveReader reader;
+  REQUIRE(reader.open(archive).has_value());
+
+  auto bad_res = reader.unpack_all(out_dir, nullptr, "wrong_password");
+  if (!bad_res) {
+    CHECK((bad_res.error() == ErrorCode::CorruptedArchive ||
+           bad_res.error() == ErrorCode::DecryptionFailed));
+  }
+
+  REQUIRE(reader.unpack_all(out_dir, nullptr, "strong_password").has_value());
+  CHECK(read_file(out_dir / "secret.txt") == secret);
+
+  std::filesystem::remove_all(test_dir);
+  std::filesystem::remove_all(out_dir);
+  std::filesystem::remove(archive);
+}
+
+TEST_CASE("Tamper Detection (FNV-1a)", "[vfs_core][crypto]") {
+  const std::filesystem::path test_dir = "tamper_in";
+  const std::filesystem::path archive = "tamper.avv";
+
+  std::filesystem::remove_all(test_dir);
+  std::filesystem::remove(archive);
+  std::filesystem::create_directories(test_dir);
+
+  write_file(test_dir / "data.txt", "Data to be tampered with.");
+
+  ArchiveWriter writer;
+  REQUIRE(writer.pack_directory(test_dir, archive).has_value());
+
+  {
+    std::fstream f(archive, std::ios::binary | std::ios::in | std::ios::out);
+    REQUIRE(f.is_open());
+    f.seekg(30, std::ios::beg);
+    char c;
+    f.read(&c, 1);
+    c ^= 0xFF;
+    f.seekp(30, std::ios::beg);
+    f.write(&c, 1);
+  }
+
+  ArchiveReader reader;
+  auto res = reader.open(archive);
+  REQUIRE_FALSE(res.has_value());
+  CHECK(res.error() == ErrorCode::HashMismatch);
+
+  std::filesystem::remove_all(test_dir);
+  std::filesystem::remove(archive);
+}
+
+// ===========================================================================
+// Journaling Tests
+// ===========================================================================
+
+TEST_CASE("Journaling Resume Roundtrip", "[vfs_core][journal]") {
+  const std::filesystem::path test_dir = "journal_in";
+  const std::filesystem::path out_dir = "journal_out";
+  const std::filesystem::path archive = "journal_test.avv";
+
+  std::filesystem::remove_all(test_dir);
+  std::filesystem::remove_all(out_dir);
+  std::filesystem::remove(archive);
+  std::filesystem::remove(archive.string() + ".tmp");
+  std::filesystem::remove(archive.string() + "-journal");
+  std::filesystem::create_directories(test_dir);
+
+  // Create 10 tiny files
+  for (int i = 0; i < 10; ++i) {
+    write_file(test_dir / ("file_" + std::to_string(i) + ".txt"),
+               "Content " + std::to_string(i));
+  }
+
+  // Attempt to pack, but "crash" after writing 5 files
+  ArchiveWriter writer;
+  bool crashed = false;
+  try {
+    (void)writer.pack_directory(
+        test_dir, archive, DEFAULT_COMPRESSION_LEVEL,
+        [](uint32_t current, uint32_t total, const std::string &path) {
+          if (current == 5) {
+            throw std::runtime_error("Simulated crash");
+          }
+        },
+        {}, true);
+  } catch (const std::exception &) {
+    crashed = true;
+  }
+
+  REQUIRE(crashed);
+  REQUIRE_FALSE(
+      std::filesystem::exists(archive)); // The final archive shouldn't exist
+  REQUIRE(std::filesystem::exists(archive.string() + ".tmp"));
+  REQUIRE(std::filesystem::exists(archive.string() + "-journal"));
+
+  // Resume the packing with a normal callback
+  REQUIRE(writer
+              .pack_directory(test_dir, archive, DEFAULT_COMPRESSION_LEVEL,
+                              nullptr, {}, true)
+              .has_value());
+
+  // Post-resume verify
+  REQUIRE(std::filesystem::exists(archive));
+  REQUIRE_FALSE(std::filesystem::exists(archive.string() + ".tmp"));
+  REQUIRE_FALSE(std::filesystem::exists(archive.string() + "-journal"));
+
+  // Unpack and verify
+  ArchiveReader reader;
+  REQUIRE(reader.open(archive).has_value());
+  REQUIRE(reader.get_entries().size() == 10);
+  REQUIRE(reader.unpack_all(out_dir).has_value());
+
+  for (int i = 0; i < 10; ++i) {
+    CHECK(read_file(out_dir / ("file_" + std::to_string(i) + ".txt")) ==
+          "Content " + std::to_string(i));
+  }
+
+  std::filesystem::remove_all(test_dir);
+  std::filesystem::remove_all(out_dir);
+  std::filesystem::remove(archive);
+}
+
+// ===========================================================================
+// Append File Tests
+// ===========================================================================
+
+TEST_CASE("AVV2 Append File Roundtrip", "[vfs_core][append]") {
+  const std::filesystem::path test_dir = "append_in";
+  const std::filesystem::path out_dir = "append_out";
+  const std::filesystem::path archive = "append.avv";
+
+  std::filesystem::remove_all(test_dir);
+  std::filesystem::remove_all(out_dir);
+  std::filesystem::remove(archive);
+  std::filesystem::create_directories(test_dir);
+
+  write_file(test_dir / "file1.txt", "Initial file content");
+
+  ArchiveWriter writer;
+  REQUIRE(writer.pack_directory(test_dir, archive).has_value());
+
+  // Append a NEW file
+  const std::filesystem::path new_file = "append_new.txt";
+  write_file(new_file, "Appended file content");
+  REQUIRE(writer.append_file(new_file, "file2.txt", archive).has_value());
+
+  // Overwrite the EXISTING file
+  write_file(new_file, "Overwritten file content");
+  REQUIRE(writer.append_file(new_file, "file1.txt", archive).has_value());
+
+  ArchiveReader reader;
+  REQUIRE(reader.open(archive).has_value());
+  REQUIRE(reader.get_entries().size() == 2);
+  REQUIRE(reader.unpack_all(out_dir).has_value());
+
+  CHECK(read_file(out_dir / "file1.txt") == "Overwritten file content");
+  CHECK(read_file(out_dir / "file2.txt") == "Appended file content");
+
+  std::filesystem::remove_all(test_dir);
+  std::filesystem::remove_all(out_dir);
+  std::filesystem::remove(archive);
+  std::filesystem::remove(new_file);
+}
+
+TEST_CASE("Append File Error Handling", "[vfs_core][append]") {
+  const std::filesystem::path archive = "append_err.avv";
+  ArchiveWriter writer;
+
+  SECTION("Source file does not exist") {
+    auto res = writer.append_file("does_not_exist.txt", "virt.txt", archive);
+    REQUIRE_FALSE(res.has_value());
+    CHECK(res.error() == ErrorCode::FileNotFound);
+  }
+
+  SECTION("Archive does not exist") {
+    const std::filesystem::path real_file = "real_file.txt";
+    write_file(real_file, "data");
+    auto res = writer.append_file(real_file, "virt.txt", "no_archive.avv");
+    REQUIRE_FALSE(res.has_value());
+    CHECK(res.error() == ErrorCode::IOError);
+    std::filesystem::remove(real_file);
+  }
+
+  SECTION("Archive has invalid magic") {
+    const std::filesystem::path real_file = "real_file.txt";
+    write_file(real_file, "data");
+    write_file(archive, "NOT_AN_AVV_ARCHIVE_AT_ALL");
+    auto res = writer.append_file(real_file, "virt.txt", archive);
+    REQUIRE_FALSE(res.has_value());
+    CHECK(res.error() == ErrorCode::InvalidMagic);
+    std::filesystem::remove(real_file);
+    std::filesystem::remove(archive);
+  }
+}
+
+TEST_CASE("AVV2 Append Encrypted File", "[vfs_core][append][crypto]") {
+  const std::filesystem::path test_dir = "append_crypto_in";
+  const std::filesystem::path out_dir = "append_crypto_out";
+  const std::filesystem::path archive = "append_crypto.avv";
+  const std::string password = "append_secret";
+
+  std::filesystem::remove_all(test_dir);
+  std::filesystem::remove_all(out_dir);
+  std::filesystem::remove(archive);
+  std::filesystem::create_directories(test_dir);
+
+  write_file(test_dir / "file1.txt", "Initial file content");
+
+  ArchiveWriter writer;
+  EncryptionOptions enc;
+  enc.algorithm = EncryptionAlgorithm::Aes256Ctr;
+  enc.key = password;
+
+  REQUIRE(writer
+              .pack_directory(test_dir, archive, DEFAULT_COMPRESSION_LEVEL,
+                              nullptr, enc)
+              .has_value());
+
+  const std::filesystem::path new_file = "append_new_crypto.txt";
+  write_file(new_file, "Appended encrypted content");
+  REQUIRE(writer
+              .append_file(new_file, "file2.txt", archive,
+                           DEFAULT_COMPRESSION_LEVEL, enc)
+              .has_value());
+
+  ArchiveReader reader;
+  REQUIRE(reader.open(archive).has_value());
+  REQUIRE(reader.get_entries().size() == 2);
+  REQUIRE(reader.unpack_all(out_dir, nullptr, password).has_value());
+
+  CHECK(read_file(out_dir / "file1.txt") == "Initial file content");
+  CHECK(read_file(out_dir / "file2.txt") == "Appended encrypted content");
+
+  std::filesystem::remove_all(test_dir);
+  std::filesystem::remove_all(out_dir);
+  std::filesystem::remove(archive);
+  std::filesystem::remove(new_file);
+}

@@ -49,6 +49,9 @@ static void print_usage(const char *prog) {
             << "  -v          Verbose: print each file.\n"
             << "  -c <level>  LZ4 compression level (default 3; range 1-12).\n"
             << "  -s <GB>     Chunk size for split archives (default 12).\n"
+            << "  --encrypt <alg>  Algorithm to use: xor, aes\n"
+            << "  --key <pass>     Password for encryption / decryption\n"
+            << "  --no-journal     Disable resume journaling\n"
             << "\nDrag-and-drop:\n"
             << "  Folder → split-pack at 12 GiB chunks.\n"
             << "  .avv   → unpack beside the archive.\n";
@@ -134,6 +137,8 @@ int main(int argc, char **argv) {
   bool verbose = false;
   int comp_level = vfs::DEFAULT_COMPRESSION_LEVEL;
   uint64_t chunk_gb = 12;
+  vfs::EncryptionOptions enc_opts;
+  bool enable_journal = true;
   int arg_offset = 1;
 
   while (arg_offset < argc) {
@@ -155,6 +160,31 @@ int main(int argc, char **argv) {
         return 1;
       }
       comp_level = static_cast<int>(val);
+    } else if (a == "--encrypt") {
+      if (arg_offset + 1 >= argc) {
+        std::cerr << "Error: --encrypt requires 'xor' or 'aes'.\n";
+        return 1;
+      }
+      std::string alg = argv[++arg_offset];
+      if (alg == "xor")
+        enc_opts.algorithm = vfs::EncryptionAlgorithm::Xor;
+      else if (alg == "aes")
+        enc_opts.algorithm = vfs::EncryptionAlgorithm::Aes256Ctr;
+      else {
+        std::cerr << "Error: Unknown algorithm '" << alg << "'.\n";
+        return 1;
+      }
+      ++arg_offset;
+    } else if (a == "--key") {
+      if (arg_offset + 1 >= argc) {
+        std::cerr << "Error: --key requires a password.\n";
+        return 1;
+      }
+      enc_opts.key = argv[++arg_offset];
+      ++arg_offset;
+    } else if (a == "--no-journal") {
+      enable_journal = false;
+      ++arg_offset;
     } else
       break;
   }
@@ -186,8 +216,8 @@ int main(int argc, char **argv) {
                 << comp_level << ")\n\n";
 
       vfs::ArchiveWriter writer;
-      auto r = writer.pack_directory_split(dropped, stem, chunk_bytes,
-                                           comp_level, render_progress);
+      auto r = writer.pack_directory_split(
+          dropped, stem, chunk_bytes, comp_level, render_progress, {}, true);
       if (!r) {
         std::cerr << "Error: " << vfs::error_code_to_string(r.error()) << "\n";
         rc = 1;
@@ -275,7 +305,8 @@ int main(int argc, char **argv) {
     }
     vfs::ArchiveWriter writer;
     auto r = writer.pack_directory(argv[arg_offset + 2], argv[arg_offset + 1],
-                                   comp_level, render_progress);
+                                   comp_level, render_progress, enc_opts,
+                                   enable_journal);
     if (!r) {
       std::cerr << "Error: " << vfs::error_code_to_string(r.error()) << "\n";
       return 1;
@@ -295,9 +326,9 @@ int main(int argc, char **argv) {
       return 1;
     }
     vfs::ArchiveWriter writer;
-    auto r =
-        writer.pack_directory_split(argv[arg_offset + 2], argv[arg_offset + 1],
-                                    chunk_bytes, comp_level, render_progress);
+    auto r = writer.pack_directory_split(
+        argv[arg_offset + 2], argv[arg_offset + 1], chunk_bytes, comp_level,
+        render_progress, enc_opts, enable_journal);
     if (!r) {
       std::cerr << "Error: " << vfs::error_code_to_string(r.error()) << "\n";
       return 1;
@@ -325,7 +356,7 @@ int main(int argc, char **argv) {
     }
     if (verbose)
       print_entries(reader, "extract");
-    r = reader.unpack_all(argv[arg_offset + 2], render_progress);
+    r = reader.unpack_all(argv[arg_offset + 2], render_progress, enc_opts.key);
     if (!r) {
       std::cerr << "Error: " << vfs::error_code_to_string(r.error()) << "\n";
       return 1;

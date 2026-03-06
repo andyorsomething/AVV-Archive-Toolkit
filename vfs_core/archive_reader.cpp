@@ -4,6 +4,7 @@
  */
 #include "archive_reader.h"
 #include "../third_party/lz4/lz4frame.h"
+#include "crypto_utils.h"
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -53,6 +54,31 @@ Result<void> ArchiveReader::open(const std::filesystem::path &archive_file) {
   } else {
     is_split_ = false;
     chunk_stem_ = "";
+  }
+
+  // Verify archive hash
+  std::ifstream hash_in(archive_file, std::ios::binary);
+  if (hash_in) {
+    ArchiveHeader hdr;
+    hash_in.read(reinterpret_cast<char *>(&hdr), sizeof(hdr));
+    const std::string_view magic_sv(hdr.magic, 4);
+    if (magic_sv != "AVV1" && magic_sv != "AVV2" && magic_sv != "AVV3") {
+      return vfs::unexpected<ErrorCode>(ErrorCode::InvalidMagic);
+    }
+    uint64_t expected = from_disk64(hdr.reserved);
+    if (expected != 0) {
+      char buf[8192];
+      Fnv1a64 hasher;
+      while (hash_in.read(buf, sizeof(buf))) {
+        hasher.update(buf, static_cast<size_t>(hash_in.gcount()));
+      }
+      if (hash_in.gcount() > 0) {
+        hasher.update(buf, static_cast<size_t>(hash_in.gcount()));
+      }
+      if (hasher.digest() != expected) {
+        return vfs::unexpected<ErrorCode>(ErrorCode::HashMismatch);
+      }
+    }
   }
 
   return read_central_directory();
@@ -160,7 +186,8 @@ Result<void> ArchiveReader::read_central_directory() {
 ///        read_file_data.
 static Result<std::vector<char>>
 read_entry_data(const ArchiveReader::FileEntry &entry,
-                const std::filesystem::path &data_file) {
+                const std::filesystem::path &data_file,
+                const std::string &password) {
   if (entry.size == 0)
     return std::vector<char>{};
 
@@ -174,11 +201,32 @@ read_entry_data(const ArchiveReader::FileEntry &entry,
 
   std::vector<char> result(static_cast<size_t>(entry.size));
 
-  if (entry.flags & 0x01) {
-    std::vector<char> comp(static_cast<size_t>(entry.compressed_size));
-    if (!in.read(comp.data(), static_cast<std::streamsize>(comp.size())))
-      return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);
+  std::vector<char> comp(static_cast<size_t>(entry.compressed_size));
+  if (!in.read(comp.data(), static_cast<std::streamsize>(comp.size())))
+    return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);
 
+  if (entry.flags & (0x04 | 0x08)) {
+    if (password.empty())
+      return vfs::unexpected<ErrorCode>(ErrorCode::DecryptionFailed);
+
+    std::span<uint8_t> data_span(reinterpret_cast<uint8_t *>(comp.data()),
+                                 comp.size());
+    if (entry.flags & 0x04) {
+      CryptoUtils::xor_cipher(data_span, password, 0);
+    } else if (entry.flags & 0x08) {
+      if (comp.size() < 16)
+        return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);
+      std::vector<uint8_t> iv(16);
+      std::memcpy(iv.data(), comp.data(), 16);
+      auto derived_key = CryptoUtils::derive_aes256_key(password);
+      std::span<uint8_t> encrypted_payload(
+          reinterpret_cast<uint8_t *>(comp.data() + 16), comp.size() - 16);
+      CryptoUtils::aes256_ctr_cipher(encrypted_payload, derived_key, iv, 0);
+      comp.erase(comp.begin(), comp.begin() + 16);
+    }
+  }
+
+  if (entry.flags & 0x01) {
     LZ4F_dctx *dctx = nullptr;
     if (LZ4F_isError(LZ4F_createDecompressionContext(&dctx, LZ4F_VERSION)))
       return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);
@@ -192,8 +240,10 @@ read_entry_data(const ArchiveReader::FileEntry &entry,
     if (LZ4F_isError(ret) || dst_size != entry.size)
       return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);
   } else {
-    if (!in.read(result.data(), static_cast<std::streamsize>(result.size())))
+    // Already in `comp`, need to move to `result`
+    if (comp.size() != entry.size)
       return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);
+    std::memcpy(result.data(), comp.data(), comp.size());
   }
   return result;
 }
@@ -203,7 +253,8 @@ read_entry_data(const ArchiveReader::FileEntry &entry,
 // ---------------------------------------------------------------------------
 
 Result<void> ArchiveReader::unpack_all(const std::filesystem::path &output_dir,
-                                       ProgressCallback progress) {
+                                       ProgressCallback progress,
+                                       const std::string &password) {
   if (!is_open_)
     return vfs::unexpected<ErrorCode>(ErrorCode::IOError);
 
@@ -222,7 +273,8 @@ Result<void> ArchiveReader::unpack_all(const std::filesystem::path &output_dir,
       return vfs::unexpected<ErrorCode>(ErrorCode::IOError);
 
     if (entry.size > 0) {
-      auto data = read_entry_data(entry, chunk_path_for(entry.chunk_index));
+      auto data =
+          read_entry_data(entry, chunk_path_for(entry.chunk_index), password);
       if (!data)
         return vfs::unexpected<ErrorCode>(data.error());
       out.write(data.value().data(),
@@ -243,7 +295,8 @@ Result<void> ArchiveReader::unpack_all(const std::filesystem::path &output_dir,
 // ---------------------------------------------------------------------------
 
 Result<std::vector<char>>
-ArchiveReader::read_file_data(const std::string &internal_path) {
+ArchiveReader::read_file_data(const std::string &internal_path,
+                              const std::string &password) {
   if (!is_open_)
     return vfs::unexpected<ErrorCode>(ErrorCode::IOError);
 
@@ -256,7 +309,7 @@ ArchiveReader::read_file_data(const std::string &internal_path) {
   if (!found)
     return vfs::unexpected<ErrorCode>(ErrorCode::FileNotFound);
 
-  return read_entry_data(*found, chunk_path_for(found->chunk_index));
+  return read_entry_data(*found, chunk_path_for(found->chunk_index), password);
 }
 
 // ---------------------------------------------------------------------------
@@ -265,9 +318,10 @@ ArchiveReader::read_file_data(const std::string &internal_path) {
 
 Result<void>
 ArchiveReader::extract_file(const std::string &internal_path,
-                            const std::filesystem::path &output_path) {
+                            const std::filesystem::path &output_path,
+                            const std::string &password) {
 
-  auto data_result = read_file_data(internal_path);
+  auto data_result = read_file_data(internal_path, password);
   if (!data_result)
     return vfs::unexpected<ErrorCode>(data_result.error());
 

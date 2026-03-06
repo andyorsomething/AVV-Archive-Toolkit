@@ -3,9 +3,11 @@
 // Dear ImGui frontend for the VFS / .avv archive system.
 // ============================================================
 #include "../vfs_core/archive_reader.h"
+#include "../vfs_core/archive_writer.h"
 #include "backends/imgui_impl_opengl3.h"
 #include "backends/imgui_impl_sdl2.h"
 #include "imgui.h"
+#include "win32_dragdrop.h"
 #include <SDL.h>
 #include <SDL_opengl.h>
 #include <algorithm>
@@ -13,13 +15,18 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
 #include <vector>
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "../third_party/stb_image/stb_image.h"
 
 // ============================================================
 // Helpers
@@ -46,6 +53,20 @@ static std::string format_size(uint64_t bytes) {
 // ============================================================
 
 /**
+ * @struct DirectoryNode
+ * @brief Represents a single level in the virtual file system's folder
+ * hierarchy.
+ */
+struct DirectoryNode {
+  std::string name; ///< Name of this specific directory (e.g., "textures").
+  std::vector<const vfs::ArchiveReader::FileEntry *>
+      files; ///< Pointers to files residing within this directory.
+  std::vector<std::unique_ptr<DirectoryNode>>
+      subdirs; ///< Child directories nested under this node.
+  DirectoryNode *parent = nullptr; ///< Pointer to parent node (null for root).
+};
+
+/**
  * @struct AppState
  * @brief Central application state shared across all VFB UI panels.
  */
@@ -60,8 +81,18 @@ struct AppState {
       selected_entry; ///< Currently selected file.
   std::vector<char>
       preview_data; ///< Raw bytes of the selected file (plus \0 sentinel).
-  char search_buf[256] = {}; ///< Text filter for the explorer table.
+  std::string drag_out_pending; ///< Filename pending extraction and drag out.
+  char search_buf[256] = {};    ///< Text filter for the explorer table.
+  char global_password[128] =
+      {}; ///< Decryption password if archive is encrypted.
   char status_msg[512] = "No archive open."; ///< Persistent status bar text.
+
+  GLuint preview_texture = 0; ///< OpenGL texture ID for the image preview.
+  int preview_width = 0;      ///< Width of the decoded preview image.
+  int preview_height = 0;     ///< Height of the decoded preview image.
+
+  std::unique_ptr<DirectoryNode> root_dir; ///< Virtual directory tree root.
+  DirectoryNode *current_dir = nullptr;    ///< Current active directory.
 
   // ---- Extraction progress state ----
   std::atomic<bool> extracting{false};
@@ -85,6 +116,56 @@ struct AppState {
       archive_path_str = path;
       std::snprintf(status_msg, sizeof(status_msg), "Opened: %s  (%zu files)",
                     path.c_str(), reader->get_entries().size());
+
+      root_dir = std::make_unique<DirectoryNode>();
+      root_dir->name = "<root>";
+      current_dir = root_dir.get();
+
+      for (const auto &e : reader->get_entries()) {
+        std::string p = e.path;
+        std::replace(p.begin(), p.end(), '\\', '/');
+        size_t pos = 0;
+        DirectoryNode *curr = root_dir.get();
+        while ((pos = p.find('/')) != std::string::npos) {
+          std::string dir = p.substr(0, pos);
+          p.erase(0, pos + 1);
+          auto it = std::find_if(curr->subdirs.begin(), curr->subdirs.end(),
+                                 [&](const std::unique_ptr<DirectoryNode> &n) {
+                                   return n->name == dir;
+                                 });
+          if (it == curr->subdirs.end()) {
+            auto node = std::make_unique<DirectoryNode>();
+            node->name = dir;
+            node->parent = curr;
+            curr->subdirs.push_back(std::move(node));
+            curr = curr->subdirs.back().get();
+          } else {
+            curr = it->get();
+          }
+        }
+        if (!p.empty())
+          curr->files.push_back(&e);
+      }
+
+      std::function<void(DirectoryNode *)> sort_tree =
+          [&](DirectoryNode *node) {
+            std::sort(node->subdirs.begin(), node->subdirs.end(),
+                      [](const std::unique_ptr<DirectoryNode> &a,
+                         const std::unique_ptr<DirectoryNode> &b) {
+                        return a->name < b->name;
+                      });
+            std::sort(
+                node->files.begin(), node->files.end(),
+                [](const vfs::ArchiveReader::FileEntry *a,
+                   const vfs::ArchiveReader::FileEntry *b) {
+                  return std::filesystem::path(a->path).filename().string() <
+                         std::filesystem::path(b->path).filename().string();
+                });
+            for (auto &child : node->subdirs) {
+              sort_tree(child.get());
+            }
+          };
+      sort_tree(root_dir.get());
     } else {
       std::snprintf(status_msg, sizeof(status_msg),
                     "Failed to open '%s' (error %d)", path.c_str(),
@@ -96,10 +177,46 @@ struct AppState {
   void load_preview(const vfs::ArchiveReader::FileEntry &entry) {
     selected_entry = entry;
     preview_data.clear();
-    auto res = reader->read_file_data(entry.path);
+
+    if (preview_texture) {
+      glDeleteTextures(1, &preview_texture);
+      preview_texture = 0;
+    }
+
+    auto res = reader->read_file_data(entry.path, global_password);
     if (res) {
       preview_data = std::move(res.value());
+
+      std::string ext = std::filesystem::path(entry.path).extension().string();
+      std::transform(ext.begin(), ext.end(), ext.begin(),
+                     [](unsigned char c) { return std::tolower(c); });
+      if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".bmp") {
+        int channels = 0;
+        unsigned char *img = stbi_load_from_memory(
+            reinterpret_cast<const stbi_uc *>(preview_data.data()),
+            static_cast<int>(preview_data.size()), &preview_width,
+            &preview_height, &channels, 4);
+        if (img) {
+          glGenTextures(1, &preview_texture);
+          glBindTexture(GL_TEXTURE_2D, preview_texture);
+          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+#if defined(GL_UNPACK_ROW_LENGTH)
+          glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+#endif
+          glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, preview_width, preview_height,
+                       0, GL_RGBA, GL_UNSIGNED_BYTE, img);
+          stbi_image_free(img);
+        }
+      }
       preview_data.push_back('\0'); // null-terminate for ImGui text display
+    } else if (res.error() == vfs::ErrorCode::DecryptionFailed) {
+      std::string msg = "Access Denied (Decryption Failed): Enter correct "
+                        "password in the top bar.";
+      preview_data.assign(msg.begin(), msg.end());
+      preview_data.push_back('\0');
     }
   }
 
@@ -115,14 +232,15 @@ struct AppState {
     extracting.store(true);
     extract_succeeded = false;
 
-    extract_thread = std::thread([this, out_dir]() {
+    std::string pass = global_password;
+    extract_thread = std::thread([this, out_dir, pass]() {
       auto cb = [this](uint32_t cur, uint32_t tot, const std::string &path) {
         extract_current.store(cur);
         extract_total.store(tot);
         std::lock_guard<std::mutex> lk(extract_mutex);
         extract_current_file = path;
       };
-      auto r = reader->unpack_all(out_dir, cb);
+      auto r = reader->unpack_all(out_dir, cb, pass);
       extract_succeeded = r.has_value();
       extracting.store(false);
     });
@@ -131,6 +249,8 @@ struct AppState {
   ~AppState() {
     if (extract_thread.joinable())
       extract_thread.join();
+    if (preview_texture)
+      glDeleteTextures(1, &preview_texture);
   }
 };
 
@@ -159,6 +279,13 @@ static bool render_menu_bar(AppState &state, bool &show_hex) {
       ImGui::EndMenu();
     }
     if (state.archive_open) {
+      ImGui::Spacing();
+      ImGui::Spacing();
+      ImGui::SetNextItemWidth(150.f);
+      ImGui::InputTextWithHint(
+          "##global_pass", "Password...", state.global_password,
+          sizeof(state.global_password), ImGuiInputTextFlags_Password);
+
       float avail = ImGui::GetContentRegionAvail().x;
       ImGui::SameLine(ImGui::GetWindowWidth() - avail);
       ImGui::TextDisabled("%s", state.archive_path_str.c_str());
@@ -221,80 +348,150 @@ static void render_explorer(AppState &state) {
     const auto &entries = state.reader->get_entries();
     const std::string filter(state.search_buf);
 
-    std::vector<const vfs::ArchiveReader::FileEntry *> visible;
-    visible.reserve(entries.size());
-    for (const auto &e : entries) {
-      if (filter.empty() || e.path.find(filter) != std::string::npos)
-        visible.push_back(&e);
-    }
-
-    if (ImGuiTableSortSpecs *specs = ImGui::TableGetSortSpecs()) {
-      if (specs->SpecsCount > 0) {
-        const int col = specs->Specs[0].ColumnIndex;
-        const bool asc =
-            (specs->Specs[0].SortDirection == ImGuiSortDirection_Ascending);
-        std::sort(
-            visible.begin(), visible.end(),
-            [&](const vfs::ArchiveReader::FileEntry *a,
-                const vfs::ArchiveReader::FileEntry *b) {
-              auto cmp = [&]() -> int {
-                if (col == 0)
-                  return a->path.compare(b->path);
-                if (col == 1)
-                  return (a->size < b->size) ? -1 : (a->size > b->size) ? 1 : 0;
-                if (col == 2)
-                  return (a->compressed_size < b->compressed_size)   ? -1
-                         : (a->compressed_size > b->compressed_size) ? 1
-                                                                     : 0;
-                return 0;
-              };
-              return asc ? cmp() < 0 : cmp() > 0;
-            });
-        specs->SpecsDirty = false;
+    if (!filter.empty()) {
+      std::vector<const vfs::ArchiveReader::FileEntry *> visible;
+      visible.reserve(entries.size());
+      for (const auto &e : entries) {
+        if (e.path.find(filter) != std::string::npos)
+          visible.push_back(&e);
       }
-    }
 
-    for (const auto *ep : visible) {
-      ImGui::TableNextRow();
-      ImGui::TableSetColumnIndex(0);
-
-      const bool selected = state.selected_entry.has_value() &&
-                            state.selected_entry->path == ep->path;
-      if (ImGui::Selectable(ep->path.c_str(), selected,
-                            ImGuiSelectableFlags_SpanAllColumns |
-                                ImGuiSelectableFlags_AllowDoubleClick))
-        state.load_preview(*ep);
-
-      // Right-click context menu
-      if (ImGui::BeginPopupContextItem()) {
-        ImGui::Text("  %s", ep->path.c_str());
-        ImGui::Separator();
-        if (ImGui::MenuItem("Copy Path"))
-          ImGui::SetClipboardText(ep->path.c_str());
-
-        if (ImGui::MenuItem("Extract to CWD")) {
-          auto res = state.reader->extract_file(
-              ep->path, std::filesystem::current_path() / ep->path);
-          if (res)
-            std::snprintf(state.status_msg, sizeof(state.status_msg),
-                          "Extracted: %s", ep->path.c_str());
-          else
-            std::snprintf(state.status_msg, sizeof(state.status_msg),
-                          "Extract failed (error %d)",
-                          static_cast<int>(res.error()));
+      if (ImGuiTableSortSpecs *specs = ImGui::TableGetSortSpecs()) {
+        if (specs->SpecsCount > 0) {
+          const int col = specs->Specs[0].ColumnIndex;
+          const bool asc =
+              (specs->Specs[0].SortDirection == ImGuiSortDirection_Ascending);
+          std::sort(visible.begin(), visible.end(),
+                    [&](const vfs::ArchiveReader::FileEntry *a,
+                        const vfs::ArchiveReader::FileEntry *b) {
+                      auto cmp = [&]() -> int {
+                        if (col == 0)
+                          return a->path.compare(b->path);
+                        if (col == 1)
+                          return (a->size < b->size)   ? -1
+                                 : (a->size > b->size) ? 1
+                                                       : 0;
+                        if (col == 2)
+                          return (a->compressed_size < b->compressed_size) ? -1
+                                 : (a->compressed_size > b->compressed_size)
+                                     ? 1
+                                     : 0;
+                        return 0;
+                      };
+                      return asc ? cmp() < 0 : cmp() > 0;
+                    });
+          specs->SpecsDirty = false;
         }
-        ImGui::EndPopup();
       }
 
-      ImGui::TableSetColumnIndex(1);
-      ImGui::TextUnformatted(format_size(ep->size).c_str());
-      ImGui::TableSetColumnIndex(2);
-      ImGui::TextUnformatted(format_size(ep->compressed_size).c_str());
-      ImGui::TableSetColumnIndex(3);
-      if (ep->flags & 0x01)
-        ImGui::TextColored({0.4f, 0.9f, 0.5f, 1.f}, "LZ4");
-      else
-        ImGui::TextDisabled("Raw");
+      for (const auto *ep : visible) {
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        const bool selected = state.selected_entry.has_value() &&
+                              state.selected_entry->path == ep->path;
+        if (ImGui::Selectable(ep->path.c_str(), selected,
+                              ImGuiSelectableFlags_SpanAllColumns |
+                                  ImGuiSelectableFlags_AllowDoubleClick)) {
+          state.load_preview(*ep);
+        }
+        if (ImGui::IsItemActive() &&
+            ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+          state.drag_out_pending = ep->path;
+        }
+        if (ImGui::BeginPopupContextItem()) {
+          ImGui::Text("  %s", ep->path.c_str());
+          ImGui::Separator();
+          if (ImGui::MenuItem("Copy Path"))
+            ImGui::SetClipboardText(ep->path.c_str());
+          if (ImGui::MenuItem("Extract to CWD")) {
+            auto res = state.reader->extract_file(
+                ep->path,
+                std::filesystem::current_path() /
+                    std::filesystem::path(ep->path).filename(),
+                state.global_password);
+            if (res)
+              std::snprintf(state.status_msg, sizeof(state.status_msg),
+                            "Extracted: %s", ep->path.c_str());
+            else
+              std::snprintf(state.status_msg, sizeof(state.status_msg),
+                            "Extract failed");
+          }
+          ImGui::EndPopup();
+        }
+        ImGui::TableSetColumnIndex(1);
+        ImGui::TextUnformatted(format_size(ep->size).c_str());
+        ImGui::TableSetColumnIndex(2);
+        ImGui::TextUnformatted(format_size(ep->compressed_size).c_str());
+        ImGui::TableSetColumnIndex(3);
+        if (ep->flags & 0x01)
+          ImGui::TextColored({0.4f, 0.9f, 0.5f, 1.f}, "LZ4");
+        else
+          ImGui::TextDisabled("Raw");
+      }
+    } else if (state.current_dir) {
+      for (const auto &subdir : state.current_dir->subdirs) {
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        std::string label = "[Folder] " + subdir->name;
+        if (ImGui::Selectable(label.c_str(), false,
+                              ImGuiSelectableFlags_SpanAllColumns |
+                                  ImGuiSelectableFlags_AllowDoubleClick)) {
+          if (ImGui::IsMouseDoubleClicked(0)) {
+            state.current_dir = subdir.get();
+          }
+        }
+        ImGui::TableSetColumnIndex(1);
+        ImGui::TextUnformatted("-");
+        ImGui::TableSetColumnIndex(2);
+        ImGui::TextUnformatted("-");
+        ImGui::TableSetColumnIndex(3);
+        ImGui::TextUnformatted("-");
+      }
+
+      for (const auto *ep : state.current_dir->files) {
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        std::string filename =
+            std::filesystem::path(ep->path).filename().string();
+        const bool selected = state.selected_entry.has_value() &&
+                              state.selected_entry->path == ep->path;
+        if (ImGui::Selectable(filename.c_str(), selected,
+                              ImGuiSelectableFlags_SpanAllColumns |
+                                  ImGuiSelectableFlags_AllowDoubleClick)) {
+          state.load_preview(*ep);
+        }
+        if (ImGui::IsItemActive() &&
+            ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+          state.drag_out_pending = ep->path;
+        }
+        if (ImGui::BeginPopupContextItem()) {
+          ImGui::Text("  %s", filename.c_str());
+          ImGui::Separator();
+          if (ImGui::MenuItem("Copy Path"))
+            ImGui::SetClipboardText(ep->path.c_str());
+          if (ImGui::MenuItem("Extract to CWD")) {
+            auto res = state.reader->extract_file(
+                ep->path, std::filesystem::current_path() / filename,
+                state.global_password);
+            if (res)
+              std::snprintf(state.status_msg, sizeof(state.status_msg),
+                            "Extracted: %s", filename.c_str());
+            else
+              std::snprintf(state.status_msg, sizeof(state.status_msg),
+                            "Extract failed");
+          }
+          ImGui::EndPopup();
+        }
+        ImGui::TableSetColumnIndex(1);
+        ImGui::TextUnformatted(format_size(ep->size).c_str());
+        ImGui::TableSetColumnIndex(2);
+        ImGui::TextUnformatted(format_size(ep->compressed_size).c_str());
+        ImGui::TableSetColumnIndex(3);
+        if (ep->flags & 0x01)
+          ImGui::TextColored({0.4f, 0.9f, 0.5f, 1.f}, "LZ4");
+        else
+          ImGui::TextDisabled("Raw");
+      }
     }
     ImGui::EndTable();
   }
@@ -322,6 +519,27 @@ static void render_details(AppState &state, bool show_hex) {
   ImGui::Separator();
 
   if (ImGui::BeginTabBar("##preview_tabs")) {
+    if (state.preview_texture && ImGui::BeginTabItem("Image")) {
+      float max_w = ImGui::GetContentRegionAvail().x;
+      float max_h = ImGui::GetContentRegionAvail().y -
+                    ImGui::GetTextLineHeightWithSpacing() * 2.0f;
+      float asp = (float)state.preview_width / (float)state.preview_height;
+      float dis_w = (float)state.preview_width;
+      float dis_h = (float)state.preview_height;
+      if (dis_w > max_w) {
+        dis_w = max_w;
+        dis_h = dis_w / asp;
+      }
+      if (dis_h > max_h) {
+        dis_h = max_h;
+        dis_w = dis_h * asp;
+      }
+      ImGui::Image((void *)(intptr_t)state.preview_texture,
+                   ImVec2(dis_w, dis_h));
+      ImGui::Text("%dx%d Image", state.preview_width, state.preview_height);
+      ImGui::EndTabItem();
+    }
+
     if (ImGui::BeginTabItem("Text")) {
       if (!state.preview_data.empty()) {
         ImGui::InputTextMultiline("##text_preview", state.preview_data.data(),
@@ -475,9 +693,34 @@ int main(int argc, char **argv) {
           event.window.windowID == SDL_GetWindowID(window))
         done = true;
 
-      // Drag-and-drop: open a dropped .avv archive automatically
+      // Drag-and-drop: open a dropped .avv archive, or append file to an open
+      // archive
       if (event.type == SDL_DROPFILE && event.drop.file) {
-        state.open(event.drop.file);
+        std::filesystem::path dropped_path(event.drop.file);
+        if (state.archive_open && dropped_path.extension() != ".avv" &&
+            std::filesystem::is_regular_file(dropped_path)) {
+          vfs::ArchiveWriter writer;
+          vfs::EncryptionOptions enc;
+          if (state.global_password[0] != '\0') {
+            enc.algorithm = vfs::EncryptionAlgorithm::Aes256Ctr;
+            enc.key = state.global_password;
+          }
+          auto res = writer.append_file(
+              dropped_path, dropped_path.filename().string(),
+              state.archive_path_str, vfs::DEFAULT_COMPRESSION_LEVEL, enc);
+          if (res) {
+            std::snprintf(state.status_msg, sizeof(state.status_msg),
+                          "Appended: %s",
+                          dropped_path.filename().string().c_str());
+            state.open(state.archive_path_str); // Refresh the view
+          } else {
+            std::snprintf(state.status_msg, sizeof(state.status_msg),
+                          "Failed to append (error %d)",
+                          static_cast<int>(res.error()));
+          }
+        } else {
+          state.open(event.drop.file);
+        }
         SDL_free(event.drop.file);
       }
     }
@@ -565,6 +808,33 @@ int main(int argc, char **argv) {
     ImGui::End();
     ImGui::PopStyleColor();
     ImGui::PopStyleVar();
+
+    // Trigger Native Win32 Drag-and-Drop if requested
+    if (!state.drag_out_pending.empty()) {
+      std::string path_to_extract = state.drag_out_pending;
+      state.drag_out_pending.clear();
+
+      auto temp_dir = std::filesystem::temp_directory_path();
+      auto full_out_path =
+          temp_dir / std::filesystem::path(path_to_extract).filename();
+      auto res = state.reader->extract_file(path_to_extract, full_out_path,
+                                            state.global_password);
+      if (res) {
+#ifdef _WIN32
+        std::wstring wpath = full_out_path.wstring();
+        Win32DoDragDrop(wpath);
+        // clear the mouse state to avoid imgui sticking to dragging after the
+        // blocking DoDragDrop finishes
+        ImGui::GetIO().ClearInputMouse();
+#endif
+        std::snprintf(state.status_msg, sizeof(state.status_msg),
+                      "Extracted (Drag & Drop): %s", path_to_extract.c_str());
+      } else {
+        std::snprintf(state.status_msg, sizeof(state.status_msg),
+                      "Drag & Drop failed (error %d)",
+                      static_cast<int>(res.error()));
+      }
+    }
 
     // Render
     ImGui::Render();

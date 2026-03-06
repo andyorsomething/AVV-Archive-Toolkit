@@ -148,17 +148,23 @@
     <ClCompile Include="..\third_party\imgui\backends\imgui_impl_sdl2.cpp" />
     <ClCompile Include="..\third_party\imgui\backends\imgui_impl_opengl3.cpp" />
     <ClCompile Include="..\vfs_core\archive_reader.cpp" />
+    <ClCompile Include="..\vfs_core\archive_writer.cpp" />
+    <ClCompile Include="..\vfs_core\crypto_utils.cpp" />
     <ClCompile Include="..\third_party\lz4\lz4.c" />
     <ClCompile Include="..\third_party\lz4\lz4frame.c" />
     <ClCompile Include="..\third_party\lz4\lz4hc.c" />
     <ClCompile Include="..\third_party\lz4\xxhash.c" />
+    <ClCompile Include="..\third_party\tiny-aes-c\aes.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\third_party\imgui\imgui.h" />
     <ClInclude Include="..\third_party\imgui\backends\imgui_impl_sdl2.h" />
     <ClInclude Include="..\third_party\imgui\backends\imgui_impl_opengl3.h" />
     <ClInclude Include="..\vfs_core\archive_reader.h" />
+    <ClInclude Include="..\vfs_core\archive_writer.h" />
+    <ClInclude Include="..\vfs_core\crypto_utils.h" />
     <ClInclude Include="..\vfs_core\vfs_types.h" />
+    <ClInclude Include="..\third_party\tiny-aes-c\aes.h" />
   </ItemGroup>
   <ItemGroup>
     <Content Include="..\third_party\sdl2\lib\x64\SDL2.dll">

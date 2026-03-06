@@ -8,6 +8,13 @@
 
 namespace vfs {
 
+enum class EncryptionAlgorithm { None, Xor, Aes256Ctr };
+
+struct EncryptionOptions {
+  EncryptionAlgorithm algorithm = EncryptionAlgorithm::None;
+  std::string key;
+};
+
 /// @brief Default LZ4 compression level. Level 3 is the fastest LZ4-fast
 ///        level before the HC codepath, offering a good speed/ratio balance.
 constexpr int DEFAULT_COMPRESSION_LEVEL = 3;
@@ -38,7 +45,22 @@ public:
   pack_directory(const std::filesystem::path &input_dir,
                  const std::filesystem::path &output_file,
                  int compression_level = DEFAULT_COMPRESSION_LEVEL,
-                 ProgressCallback progress = nullptr);
+                 ProgressCallback progress = nullptr,
+                 const EncryptionOptions &encryption = {},
+                 bool enable_journal = true);
+
+  /// @brief Appends a single file to an existing AVV2 single-file archive.
+  /// @param source_file    Path to the raw file on the OS disk.
+  /// @param virtual_path   The path/name the file will have inside the archive.
+  /// @param archive_file   The existing .avv archive to modify.
+  /// @param compression_level LZ4 compression level.
+  /// @param encryption      Optional encryption settings.
+  [[nodiscard]] Result<void>
+  append_file(const std::filesystem::path &source_file,
+              const std::string &virtual_path,
+              const std::filesystem::path &archive_file,
+              int compression_level = DEFAULT_COMPRESSION_LEVEL,
+              const EncryptionOptions &encryption = {});
 
   /// @brief Packs into a VPK-style split AVV3 archive set.
   [[nodiscard]] Result<void>
@@ -46,7 +68,9 @@ public:
                        const std::filesystem::path &output_stem,
                        uint64_t max_chunk_bytes = DEFAULT_CHUNK_BYTES,
                        int compression_level = DEFAULT_COMPRESSION_LEVEL,
-                       ProgressCallback progress = nullptr);
+                       ProgressCallback progress = nullptr,
+                       const EncryptionOptions &encryption = {},
+                       bool enable_journal = true);
 };
 
 } // namespace vfs

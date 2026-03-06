@@ -21,8 +21,12 @@ enum class ErrorCode {
   CorruptedArchive,   ///< The archive is truncated or structurally invalid.
   IOError, ///< A fundamental OS-level I/O error occurred (e.g., failure to
            ///< read/write).
-  PermissionDenied ///< Insufficient permissions to read or write the target
-                   ///< path.
+  PermissionDenied, ///< Insufficient permissions to read or write the target
+                    ///< path.
+  HashMismatch,     ///< The archive's computed integrity hash does not match
+                    ///< the stored hash.
+  DecryptionFailed  ///< The file payload could not be decrypted (e.g., wrong
+                    ///< password).
 };
 
 /**
@@ -44,6 +48,10 @@ inline const char *error_code_to_string(ErrorCode code) {
     return "I/O Error";
   case ErrorCode::PermissionDenied:
     return "Permission Denied";
+  case ErrorCode::HashMismatch:
+    return "Hash Mismatch (Integrity Error)";
+  case ErrorCode::DecryptionFailed:
+    return "Decryption Failed";
   default:
     return "Unknown Error";
   }
@@ -166,7 +174,7 @@ static_assert(sizeof(ArchiveHeader) == 16, "Header size mismatch");
  */
 struct CentralDirectoryEntryBase {
   uint16_t path_length;
-  uint16_t flags;           ///< Bitmask. 0x01 = LZ4 Compressed.
+  uint16_t flags;           ///< Bitmask. 0x01=LZ4, 0x04=XOR, 0x08=AES.
   uint64_t size_offset;     ///< Byte offset of the file data in the archive.
   uint64_t size;            ///< Uncompressed size in bytes.
   uint64_t compressed_size; ///< On-disk size (compressed or equal to size).
@@ -184,7 +192,7 @@ static_assert(sizeof(CentralDirectoryEntryBase) == 28,
  */
 struct CentralDirectoryEntryBaseV3 {
   uint16_t path_length;
-  uint16_t flags;           ///< Bitmask. 0x01 = LZ4. 0x02 = reserved.
+  uint16_t flags;           ///< Bitmask. 0x01=LZ4, 0x04=XOR, 0x08=AES.
   uint16_t chunk_index;     ///< Which _NNN data chunk this file lives in.
   uint16_t _reserved;       ///< Padding — must be zero.
   uint64_t size_offset;     ///< Byte offset within the chunk file.

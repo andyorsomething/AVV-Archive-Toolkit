@@ -13,6 +13,7 @@ This project was developed collaboratively with AI coding assistants as a portfo
 |---|---|
 | Architecture | Designed `.avv` binary format (V1-V3), central directory layout, and split-file VPK-style architecture |
 | Core Library | Generated `ArchiveWriter`, `ArchiveReader`, endianness helpers, and `Result<T>` pattern |
+| Cryptography | Implemented FNV-1a hashing and AES-256-CTR encryption support bridging tiny-AES-c |
 | LZ4 Integration | Integrated LZ4HC level 1-12 frame compression with automatic raw storage fallback |
 | CLI Tool | Built argument parser with `pack`, `packs` (split), `unpack`, `list` commands and `-v/-s/-c` flags |
 | GUI Browser | Full Dear ImGui application with docking, high-performance hex viewer, search, and threaded extraction |

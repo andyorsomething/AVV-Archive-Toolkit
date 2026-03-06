@@ -45,18 +45,21 @@ public:
   ///        the original directory structure. Invokes @p progress (if not null)
   ///        after each file.
   [[nodiscard]] Result<void> unpack_all(const std::filesystem::path &output_dir,
-                                        ProgressCallback progress = nullptr);
+                                        ProgressCallback progress = nullptr,
+                                        const std::string &password = "");
 
   /// @brief Extracts a single file identified by @p internal_path to
   ///        @p output_path on the host filesystem.
   [[nodiscard]] Result<void>
   extract_file(const std::string &internal_path,
-               const std::filesystem::path &output_path);
+               const std::filesystem::path &output_path,
+               const std::string &password = "");
 
   /// @brief Reads a single file's decompressed bytes into memory.
   /// @return The raw bytes, or FileNotFound / IOError / CorruptedArchive.
   [[nodiscard]] Result<std::vector<char>>
-  read_file_data(const std::string &internal_path);
+  read_file_data(const std::string &internal_path,
+                 const std::string &password = "");
 
   /// @brief Returns the parsed central directory entries.
   /// @pre open() must have succeeded.
