@@ -1,0 +1,8 @@
+CompileFlags:
+  Add:
+    - -std=c++20
+    - -Ithird_party/sdl2/include
+    - -Ithird_party/imgui
+    - -Ithird_party/imgui/backends
+    - -Ithird_party/lz4
+    - -Ivfs_core
