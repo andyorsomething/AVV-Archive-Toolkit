@@ -331,6 +331,33 @@ static void render_explorer(AppState &state) {
     return;
   }
 
+  // Breadcrumbs
+  if (state.current_dir) {
+    std::vector<DirectoryNode *> crumbs;
+    DirectoryNode *curr = state.current_dir;
+    while (curr) {
+      crumbs.push_back(curr);
+      curr = curr->parent;
+    }
+    std::reverse(crumbs.begin(), crumbs.end());
+
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(2, 4));
+    for (size_t i = 0; i < crumbs.size(); ++i) {
+      if (i > 0) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("/");
+        ImGui::SameLine();
+      }
+      const char *name =
+          (crumbs[i]->parent == nullptr) ? "Root" : crumbs[i]->name.c_str();
+      if (ImGui::SmallButton(name)) {
+        state.current_dir = crumbs[i];
+      }
+    }
+    ImGui::PopStyleVar();
+    ImGui::Separator();
+  }
+
   constexpr ImGuiTableFlags TABLE_FLAGS =
       ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
       ImGuiTableFlags_Resizable | ImGuiTableFlags_Sortable |
@@ -429,6 +456,24 @@ static void render_explorer(AppState &state) {
           ImGui::TextDisabled("Raw");
       }
     } else if (state.current_dir) {
+      if (state.current_dir->parent) {
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        if (ImGui::Selectable("[Folder] ..", false,
+                              ImGuiSelectableFlags_SpanAllColumns |
+                                  ImGuiSelectableFlags_AllowDoubleClick)) {
+          if (ImGui::IsMouseDoubleClicked(0)) {
+            state.current_dir = state.current_dir->parent;
+          }
+        }
+        ImGui::TableSetColumnIndex(1);
+        ImGui::TextUnformatted("-");
+        ImGui::TableSetColumnIndex(2);
+        ImGui::TextUnformatted("-");
+        ImGui::TableSetColumnIndex(3);
+        ImGui::TextUnformatted("-");
+      }
+
       for (const auto &subdir : state.current_dir->subdirs) {
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);

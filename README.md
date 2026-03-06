@@ -65,9 +65,9 @@ vfs_packer unpack game_data_dir.avv extracted/   # also works for split archives
 ## CLI Reference
 
 ```
-vfs_packer [-v] [-c <1..12>] pack  <output.avv> <input_dir>
-vfs_packer [-v] [-c <1..12>] [-s <GB>] packs <stem> <input_dir>
-vfs_packer [-v] unpack <input.avv|_dir.avv> <output_dir>
+vfs_packer [-v] [-c <1..12>] [--encrypt <xor|aes>] [--key <pass>] pack  <output.avv> <input_dir>
+vfs_packer [-v] [-c <1..12>] [--encrypt <xor|aes>] [--key <pass>] [-s <GB>] packs <stem> <input_dir>
+vfs_packer [-v] [--key <pass>] unpack <input.avv|_dir.avv> <output_dir>
 vfs_packer list <input.avv|_dir.avv>
 ```
 
@@ -87,6 +87,8 @@ vfs_packer list <input.avv|_dir.avv>
 | `-v` | off | Verbose — print each file with size and compression method |
 | `-c <level>` | `3` | LZ4 compression level (1–12; higher = slower + smaller) |
 | `-s <GB>` | `12` | Maximum chunk size in GiB for split archives (`packs` only) |
+| `--encrypt <alg>` | `none` | Algorithm to use for packing (`xor` or `aes`) |
+| `--key <pass>` | `""` | Password used for encryption during `pack` or decryption during `unpack` |
 
 ### Examples
 
@@ -127,13 +129,14 @@ The console stays open after completion so you can read the output.
 An ImGui-based GUI for inspecting `.avv` archives (single and split) without unpacking.
 
 **Features:**
-- Sortable file table with live search/filter bar (shows chunk index for split archives)
-- File details pane with text preview and clipped hex dump viewer (ImGuiListClipper — constant frame time)
-- Right-click context menu → `Copy Path` or `Extract to CWD`
-- **File → Extract All…** with threaded progress bar modal
-- Drag-and-drop `.avv` / `_dir.avv` files onto window to open
-- Dockable panel layout with multi-viewport support
-- Custom dark theme with rounded styling
+- **Hierarchical Folder Navigation**: Browse archives via a directory tree with clickable breadcrumbs, or use the live search/filter bar to find files.
+- **Native Drag-and-Drop Operations**:
+  - **Drag-Out (Extract)**: Click and drag any file from the explorer onto your Windows desktop or folders to extract it natively.
+  - **Drag-In (Append)**: Drag any new file into the browser (while an AVV2 archive is open) to append it dynamically without a full repack.
+- **Rich Previews**: The file details pane includes instant image previews (for `.png`, `.jpg`, `.bmp` via `stb_image`), a text viewer, and a fast clipped hex dump viewer.
+- **Context Menus & Extraction**: Right-click to `Copy Path` or `Extract to CWD`. Use **File → Extract All…** for a threaded progress bar modal.
+- Drag-and-drop `.avv` / `_dir.avv` files onto the window to open them.
+- Dockable panel layout with multi-viewport support and a custom, rounded dark theme.
 
 **Keyboard shortcuts:**
 
@@ -141,6 +144,11 @@ An ImGui-based GUI for inspecting `.avv` archives (single and split) without unp
 |---|---|
 | `Ctrl+O` | Open archive dialog |
 | `Alt+F4` | Exit |
+
+**Encryption / Decryption in VFB:**
+- Use the **Password** field in the top status bar to unlock encrypted archives.
+- When an archive is open, clicking a file will attempt to decrypt it in-memory for the preview using this password.
+- If you append a file to an encrypted archive via drag-and-drop, the browser will use the current password to encrypt the new payload.
 
 Launch by setting `vfs_browser` as the Startup Project, or pass an archive on the command line:
 
@@ -228,10 +236,16 @@ vfs::ArchiveWriter writer;
 
 // Single-file archive (AVV2)
 writer.pack_directory("assets/", "game_data.avv");
-
-// Single-file with custom compression level (1-12)
-writer.pack_directory("assets/", "game_data.avv", 9);
-
+ 
+// Single-file with AES-256 encryption
+vfs::EncryptionOptions enc;
+enc.algorithm = vfs::EncryptionAlgorithm::Aes256Ctr;
+enc.key = "SuperSecret123";
+writer.pack_directory("assets/", "secure_data.avv", 3, nullptr, enc);
+ 
+// Append a single file (auto-encrypts if archive is encrypted and key is provided)
+writer.append_file("C:/Temp/new.dds", "textures/new.dds", "secure_data.avv", 3, enc);
+ 
 // Split archive (AVV3), 4 GiB chunks, level 9
 writer.pack_directory_split("assets/", "game_data",
                             4ULL * 1024 * 1024 * 1024, 9);
