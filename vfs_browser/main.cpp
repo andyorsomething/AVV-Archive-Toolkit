@@ -229,7 +229,7 @@ static void render_explorer(AppState &state) {
     }
 
     if (ImGuiTableSortSpecs *specs = ImGui::TableGetSortSpecs()) {
-      if (specs->SpecsDirty && specs->SpecsCount > 0) {
+      if (specs->SpecsCount > 0) {
         const int col = specs->Specs[0].ColumnIndex;
         const bool asc =
             (specs->Specs[0].SortDirection == ImGuiSortDirection_Ascending);
