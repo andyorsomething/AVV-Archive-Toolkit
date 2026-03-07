@@ -14,7 +14,7 @@ using ProgressCallback = std::function<void(uint32_t current, uint32_t total,
 
 /**
  * @class ArchiveReader
- * @brief Parses and unpacks AVV1/AVV2 single-file and AVV3 split archives.
+ * @brief Parses and unpacks AVV4 single-file and AVV5 split archives.
  */
 class ArchiveReader {
 public:
@@ -23,16 +23,21 @@ public:
    * @brief In-memory metadata for a single file stored inside an archive.
    */
   struct FileEntry {
-    std::string path;         ///< Relative virtual path within the archive.
-    uint16_t flags;           ///< Compression flags. 0x01 = LZ4 Frame.
-    uint16_t chunk_index;     ///< Data chunk index (AVV3 split archives only;
-                              ///< always 0 for AVV1/AVV2).
+    std::string path; ///< Relative virtual path within the archive.
+    uint16_t flags; ///< Per-file flags. Bit 0 (CDE_FLAG_LZ4) = LZ4 compressed.
+                    ///<  Bits [11:8] = CipherAlgorithm discriminant.
+                    ///<  Use cde_is_lz4() and cde_cipher_id() to read.
+    uint16_t chunk_index;     ///< Data chunk index (AVV5 split archives only;
+                              ///< always 0 for AVV4).
     uint64_t size_offset;     ///< Byte offset of the payload within its chunk.
     uint64_t size;            ///< Uncompressed file size in bytes.
     uint64_t compressed_size; ///< On-disk (compressed) size in bytes.
   };
 
+  /// @brief Constructs a new, empty ArchiveReader.
   ArchiveReader();
+
+  /// @brief Destroys the ArchiveReader and closes any open file handles.
   ~ArchiveReader();
   ArchiveReader(const ArchiveReader &) = delete;
   ArchiveReader &operator=(const ArchiveReader &) = delete;
@@ -68,6 +73,12 @@ public:
     return entries_;
   }
 
+  /// @brief Retrieves the default LZ4 compression level for new files appended
+  ///        to this archive (valid for AVV4 single-file and AVV5 split).
+  [[nodiscard]] uint8_t get_default_compression_level() const {
+    return default_compression_level_;
+  }
+
 private:
   std::filesystem::path archive_path_;
   std::filesystem::path chunk_dir_;
@@ -75,6 +86,7 @@ private:
   std::vector<FileEntry> entries_;
   bool is_open_ = false;
   bool is_split_ = false;
+  uint8_t default_compression_level_ = 3;
 
   [[nodiscard]] Result<void> read_central_directory();
   [[nodiscard]] std::filesystem::path

@@ -1,6 +1,6 @@
 /**
  * @file archive_writer.cpp
- * @brief Implements single-file (AVV2) and split (AVV3) packing with
+ * @brief Implements single-file (AVV4) and split (AVV5) packing with
  *        configurable LZ4 compression level and per-file progress callbacks.
  */
 #include "archive_writer.h"
@@ -36,8 +36,9 @@ static LZ4F_preferences_t make_lz4_prefs(int level) {
 /// @brief Result of compressing a single file payload.
 struct CompressedPayload {
   std::vector<char> data; ///< Compressed or raw bytes to write to disk.
-  uint16_t flags;         ///< 0x01 = LZ4 compressed; 0 = raw.
-  uint64_t stored_size;   ///< Number of bytes in @c data.
+  uint16_t flags; ///< CDE flags word. CDE_FLAG_LZ4 (0x0001) = LZ4 compressed;
+                  ///< cipher nibble set by cde_make_flags after encrypt step.
+  uint64_t stored_size; ///< Number of bytes in @c data.
 };
 
 /// @brief Reads a file, compresses it via LZ4 Frame, and returns the smaller
@@ -97,7 +98,7 @@ static uint32_t count_regular_files(const std::filesystem::path &dir) {
 struct TempEntry {
   std::string path;
   uint16_t flags;
-  uint16_t chunk_index; // 0 for single-file AVV2
+  uint16_t chunk_index; // 0 for single-file AVV4
   uint64_t size_offset, size, compressed_size;
 };
 
@@ -176,7 +177,7 @@ static void append_to_journal(std::ofstream &jrn, const TempEntry &e,
 }
 
 // ---------------------------------------------------------------------------
-// Single-file packing (AVV2)
+// Single-file packing (AVV4)
 // ---------------------------------------------------------------------------
 
 Result<void>
@@ -219,7 +220,7 @@ ArchiveWriter::pack_directory(const std::filesystem::path &input_dir,
   std::ios_base::openmode mode_out = std::ios::binary;
   if (!completed_entries.empty()) {
     mode_out |= std::ios::in | std::ios::out;
-    uint64_t expected_size = 16; // Header size
+    uint64_t expected_size = sizeof(ArchiveHeader); // 24 bytes
     if (!entries.empty()) {
       expected_size =
           entries.back().size_offset + entries.back().compressed_size;
@@ -237,8 +238,11 @@ ArchiveWriter::pack_directory(const std::filesystem::path &input_dir,
 
   if (completed_entries.empty()) {
     ArchiveHeader header;
-    header.version = to_disk32(2);
-    header.reserved = to_disk64(0);
+    std::memcpy(header.magic, "AVV4", 4);
+    header.version = to_disk32(4);
+    header.directory_hash = to_disk64(0);
+    header.default_compression_level = static_cast<uint8_t>(compression_level);
+    std::memset(header.padding, 0, sizeof(header.padding));
     out.write(reinterpret_cast<const char *>(&header), sizeof(header));
     if (!out.good())
       return vfs::unexpected<ErrorCode>(ErrorCode::IOError);
@@ -285,7 +289,9 @@ ArchiveWriter::pack_directory(const std::filesystem::path &input_dir,
           payload.data.size());
       if (encryption.algorithm == EncryptionAlgorithm::Xor) {
         CryptoUtils::xor_cipher(data_span, encryption.key, 0);
-        payload.flags |= 0x04;
+        payload.flags = static_cast<uint16_t>(
+            payload.flags |
+            cde_make_flags(cde_is_lz4(payload.flags), CipherAlgorithm::Xor));
       } else if (encryption.algorithm == EncryptionAlgorithm::Aes256Ctr) {
         iv.resize(16);
         std::random_device rd;
@@ -295,7 +301,9 @@ ArchiveWriter::pack_directory(const std::filesystem::path &input_dir,
           iv[i] = static_cast<uint8_t>(dist(gen));
         auto derived_key = CryptoUtils::derive_aes256_key(encryption.key);
         CryptoUtils::aes256_ctr_cipher(data_span, derived_key, iv, 0);
-        payload.flags |= 0x08;
+        payload.flags = static_cast<uint16_t>(
+            payload.flags | cde_make_flags(cde_is_lz4(payload.flags),
+                                           CipherAlgorithm::Aes256Ctr));
       }
     }
 
@@ -354,6 +362,7 @@ ArchiveWriter::pack_directory(const std::filesystem::path &input_dir,
   }
 
   ArchiveFooter footer{};
+  std::memcpy(footer.magic_end, "4VVA_EOF", 8);
   footer.directory_offset = to_disk64(dir_offset);
   out.write(reinterpret_cast<const char *>(&footer), sizeof(footer));
   if (!out.good())
@@ -373,10 +382,10 @@ ArchiveWriter::pack_directory(const std::filesystem::path &input_dir,
   }
   uint64_t final_hash = hasher.digest();
 
-  // Overwrite `reserved` field with hash
+  // Write the final hash into the `directory_hash` field of the header.
   out.clear();
-  out.seekp(8, std::ios::beg); // `reserved` is exactly 8 bytes into the file
-                               // (version is 4 bytes, magic 4)
+  out.seekp(
+      8, std::ios::beg); // directory_hash is at offset 8 (4 magic + 4 version)
   uint64_t disk_hash = to_disk64(final_hash);
   out.write(reinterpret_cast<const char *>(&disk_hash), sizeof(disk_hash));
 
@@ -389,7 +398,7 @@ ArchiveWriter::pack_directory(const std::filesystem::path &input_dir,
 }
 
 // ---------------------------------------------------------------------------
-// Append to existing AVV2
+// Append to existing AVV4
 // ---------------------------------------------------------------------------
 
 Result<void> ArchiveWriter::append_file(
@@ -415,9 +424,9 @@ Result<void> ArchiveWriter::append_file(
   if (!arc.read(reinterpret_cast<char *>(&header), sizeof(header))) {
     return vfs::unexpected<ErrorCode>(ErrorCode::IOError);
   }
-  if (std::memcmp(header.magic, "AVV2", 4) != 0) {
+  if (std::memcmp(header.magic, "AVV4", 4) != 0) {
     return vfs::unexpected<ErrorCode>(
-        ErrorCode::InvalidMagic); // Only support AVV2 single-file
+        ErrorCode::InvalidMagic); // Only support AVV4 single-file
   }
 
   // Move to the footer position to read the current central directory offset
@@ -427,7 +436,7 @@ Result<void> ArchiveWriter::append_file(
   if (!arc.read(reinterpret_cast<char *>(&footer), sizeof(footer))) {
     return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);
   }
-  if (std::memcmp(footer.magic_end, "2VVA_EOF", 8) != 0) {
+  if (std::memcmp(footer.magic_end, "4VVA_EOF", 8) != 0) {
     return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);
   }
 
@@ -473,9 +482,9 @@ Result<void> ArchiveWriter::append_file(
   // This allows us to update the archive hash without re-reading the entire
   // file
   Fnv1a64 hasher;
-  arc.seekg(16, std::ios::beg); // Skip magic (4) + version (4) + hash (8)
+  arc.seekg(24, std::ios::beg); // Skip 24 byte header
   char buf[8192];
-  uint64_t bytes_to_hash = dir_offset - 16;
+  uint64_t bytes_to_hash = dir_offset - 24;
   uint64_t hashed = 0;
   while (hashed < bytes_to_hash) {
     uint64_t to_read =
@@ -502,7 +511,9 @@ Result<void> ArchiveWriter::append_file(
         reinterpret_cast<uint8_t *>(payload.data.data()), payload.data.size());
     if (encryption.algorithm == EncryptionAlgorithm::Xor) {
       CryptoUtils::xor_cipher(data_span, encryption.key, 0);
-      payload.flags |= 0x04;
+      payload.flags = static_cast<uint16_t>(
+          payload.flags |
+          cde_make_flags(cde_is_lz4(payload.flags), CipherAlgorithm::Xor));
     } else if (encryption.algorithm == EncryptionAlgorithm::Aes256Ctr) {
       iv.resize(16);
       std::random_device rd;
@@ -512,7 +523,9 @@ Result<void> ArchiveWriter::append_file(
         iv[i] = static_cast<uint8_t>(dist(gen));
       auto derived_key = CryptoUtils::derive_aes256_key(encryption.key);
       CryptoUtils::aes256_ctr_cipher(data_span, derived_key, iv, 0);
-      payload.flags |= 0x08;
+      payload.flags = static_cast<uint16_t>(
+          payload.flags | cde_make_flags(cde_is_lz4(payload.flags),
+                                         CipherAlgorithm::Aes256Ctr));
     }
   }
 
@@ -551,13 +564,14 @@ Result<void> ArchiveWriter::append_file(
   }
 
   ArchiveFooter new_footer{};
-  std::memcpy(new_footer.magic_end, "2VVA_EOF", 8);
+  std::memcpy(new_footer.magic_end, "4VVA_EOF", 8);
   new_footer.directory_offset = to_disk64(new_dir_offset);
   arc.write(reinterpret_cast<const char *>(&new_footer), sizeof(new_footer));
 
   const uint64_t final_file_size = static_cast<uint64_t>(arc.tellp());
 
   // Compute final hash
+  arc.clear();
   arc.seekg(new_dir_offset, std::ios::beg);
   while (arc.read(buf, sizeof(buf))) {
     hasher.update(buf, static_cast<size_t>(arc.gcount()));
@@ -575,12 +589,15 @@ Result<void> ArchiveWriter::append_file(
 
   std::error_code ec;
   std::filesystem::resize_file(archive_file, final_file_size, ec);
+  if (ec) {
+    return vfs::unexpected<ErrorCode>(ErrorCode::IOError);
+  }
 
   return Result<void>{};
 }
 
 // ---------------------------------------------------------------------------
-// Split packing (AVV3)
+// Split packing (AVV5)
 // ---------------------------------------------------------------------------
 
 Result<void> ArchiveWriter::pack_directory_split(
@@ -692,7 +709,9 @@ Result<void> ArchiveWriter::pack_directory_split(
           payload.data.size());
       if (encryption.algorithm == EncryptionAlgorithm::Xor) {
         CryptoUtils::xor_cipher(data_span, encryption.key, 0);
-        payload.flags |= 0x04;
+        payload.flags = static_cast<uint16_t>(
+            payload.flags |
+            cde_make_flags(cde_is_lz4(payload.flags), CipherAlgorithm::Xor));
       } else if (encryption.algorithm == EncryptionAlgorithm::Aes256Ctr) {
         iv.resize(16);
         std::random_device rd;
@@ -702,7 +721,9 @@ Result<void> ArchiveWriter::pack_directory_split(
           iv[i] = static_cast<uint8_t>(dist(gen));
         auto derived_key = CryptoUtils::derive_aes256_key(encryption.key);
         CryptoUtils::aes256_ctr_cipher(data_span, derived_key, iv, 0);
-        payload.flags |= 0x08;
+        payload.flags = static_cast<uint16_t>(
+            payload.flags | cde_make_flags(cde_is_lz4(payload.flags),
+                                           CipherAlgorithm::Aes256Ctr));
       }
     }
 
@@ -770,9 +791,11 @@ Result<void> ArchiveWriter::pack_directory_split(
     return vfs::unexpected<ErrorCode>(ErrorCode::IOError);
 
   ArchiveHeader header;
-  std::memcpy(header.magic, "AVV3", 4);
-  header.version = to_disk32(3);
-  header.reserved = to_disk64(0);
+  std::memcpy(header.magic, "AVV5", 4);
+  header.version = to_disk32(5);
+  header.directory_hash = to_disk64(0);
+  header.default_compression_level = static_cast<uint8_t>(compression_level);
+  std::memset(header.padding, 0, sizeof(header.padding));
   dir_out.write(reinterpret_cast<const char *>(&header), sizeof(header));
 
   const uint64_t dir_offset = static_cast<uint64_t>(dir_out.tellp());
@@ -790,14 +813,14 @@ Result<void> ArchiveWriter::pack_directory_split(
   }
 
   ArchiveFooter footer{};
-  std::memcpy(footer.magic_end, "3VVA_EOF", 8);
+  std::memcpy(footer.magic_end, "5VVA_EOF", 8);
   footer.directory_offset = to_disk64(dir_offset);
   dir_out.write(reinterpret_cast<const char *>(&footer), sizeof(footer));
   // Compute final hash from the newly written directory file
   // (Notice: we do not use running_hash, as the reader expects a fresh hash for
-  // AVV3 _dir.avv)
+  // AVV5 _dir.avv)
   Fnv1a64 hasher;
-  dir_out.seekg(16, std::ios::beg);
+  dir_out.seekg(24, std::ios::beg);
   char buf[8192];
   while (dir_out.read(buf, sizeof(buf))) {
     hasher.update(buf, static_cast<size_t>(dir_out.gcount()));
@@ -816,6 +839,132 @@ Result<void> ArchiveWriter::pack_directory_split(
 
   std::filesystem::rename(dir_filename_tmp, dir_filename);
   std::filesystem::remove(journal_file);
+
+  return Result<void>{};
+}
+
+// ---------------------------------------------------------------------------
+// Delete from existing AVV4
+// ---------------------------------------------------------------------------
+
+Result<void>
+ArchiveWriter::delete_file(const std::string &virtual_path,
+                           const std::filesystem::path &archive_file) {
+
+  std::string normalized_path = virtual_path;
+  std::replace(normalized_path.begin(), normalized_path.end(), '\\', '/');
+
+  std::fstream arc(archive_file,
+                   std::ios::binary | std::ios::in | std::ios::out);
+  if (!arc) {
+    return vfs::unexpected<ErrorCode>(ErrorCode::IOError);
+  }
+
+  ArchiveHeader header;
+  if (!arc.read(reinterpret_cast<char *>(&header), sizeof(header))) {
+    return vfs::unexpected<ErrorCode>(ErrorCode::IOError);
+  }
+  if (std::memcmp(header.magic, "AVV4", 4) != 0) {
+    return vfs::unexpected<ErrorCode>(
+        ErrorCode::InvalidMagic); // Only support AVV4 single-file
+  }
+
+  // Move to the footer position to read the current central directory offset
+  arc.seekg(-static_cast<std::streamoff>(sizeof(ArchiveFooter)), std::ios::end);
+  const std::streamoff footer_pos = arc.tellg();
+  ArchiveFooter footer;
+  if (!arc.read(reinterpret_cast<char *>(&footer), sizeof(footer))) {
+    return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);
+  }
+  if (std::memcmp(footer.magic_end, "4VVA_EOF", 8) != 0) {
+    return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);
+  }
+
+  const uint64_t dir_offset = from_disk64(footer.directory_offset);
+  const uint64_t directory_size =
+      static_cast<uint64_t>(footer_pos) - dir_offset;
+
+  arc.seekg(static_cast<std::streamoff>(dir_offset), std::ios::beg);
+  std::vector<TempEntry> entries;
+  uint64_t bytes_read = 0;
+  bool found = false;
+  while (bytes_read < directory_size) {
+    CentralDirectoryEntryBase base;
+    if (!arc.read(reinterpret_cast<char *>(&base), sizeof(base)))
+      break;
+    bytes_read += sizeof(base);
+
+    uint16_t path_len = from_disk16(base.path_length);
+    std::string path(path_len, '\0');
+    if (!arc.read(&path[0], path_len))
+      break;
+    bytes_read += path_len;
+
+    if (path == normalized_path) {
+      found = true;
+      continue; // Skip this one!
+    }
+
+    TempEntry e;
+    e.path = std::move(path);
+    e.flags = from_disk16(base.flags);
+    e.chunk_index = 0;
+    e.size_offset = from_disk64(base.size_offset);
+    e.size = from_disk64(base.size);
+    e.compressed_size = from_disk64(base.compressed_size);
+    entries.push_back(std::move(e));
+  }
+
+  if (!found) {
+    return vfs::unexpected<ErrorCode>(ErrorCode::FileNotFound);
+  }
+
+  // Seek back to old directory offset to overwrite it with the shortened
+  // directory
+  arc.seekp(static_cast<std::streamoff>(dir_offset), std::ios::beg);
+
+  for (const auto &e : entries) {
+    CentralDirectoryEntryBase base{};
+    base.path_length = to_disk16(static_cast<uint16_t>(e.path.size()));
+    base.flags = to_disk16(e.flags);
+    base.size_offset = to_disk64(e.size_offset);
+    base.size = to_disk64(e.size);
+    base.compressed_size = to_disk64(e.compressed_size);
+    arc.write(reinterpret_cast<const char *>(&base), sizeof(base));
+    arc.write(e.path.c_str(), static_cast<std::streamsize>(e.path.size()));
+  }
+
+  ArchiveFooter new_footer{};
+  std::memcpy(new_footer.magic_end, "4VVA_EOF", 8);
+  new_footer.directory_offset = to_disk64(dir_offset);
+  arc.write(reinterpret_cast<const char *>(&new_footer), sizeof(new_footer));
+
+  const uint64_t final_file_size = static_cast<uint64_t>(arc.tellp());
+
+  // Compute final hash
+  arc.clear();
+  arc.seekg(24, std::ios::beg); // Skip 24-byte header
+  Fnv1a64 hasher;
+  char buf[8192];
+  while (arc.read(buf, sizeof(buf))) {
+    hasher.update(buf, static_cast<size_t>(arc.gcount()));
+  }
+  if (arc.gcount() > 0) {
+    hasher.update(buf, static_cast<size_t>(arc.gcount()));
+  }
+  const uint64_t final_hash = hasher.digest();
+
+  arc.clear();
+  arc.seekp(8, std::ios::beg); // Hash is at offset 8
+  const uint64_t disk_hash = to_disk64(final_hash);
+  arc.write(reinterpret_cast<const char *>(&disk_hash), sizeof(disk_hash));
+  arc.close();
+
+  std::error_code ec;
+  std::filesystem::resize_file(archive_file, final_file_size, ec);
+  if (ec) {
+    return vfs::unexpected<ErrorCode>(ErrorCode::IOError);
+  }
 
   return Result<void>{};
 }

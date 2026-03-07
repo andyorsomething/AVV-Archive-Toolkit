@@ -1,6 +1,6 @@
 /**
  * @file archive_reader.cpp
- * @brief Reads and unpacks AVV1/AVV2 (single-file) and AVV3 (split) archives.
+ * @brief Reads and unpacks AVV4 (single-file) and AVV5 (split) archives.
  */
 #include "archive_reader.h"
 #include "../third_party/lz4/lz4frame.h"
@@ -35,7 +35,7 @@ ArchiveReader::chunk_path_for(uint16_t chunk_index) const {
 // open
 // ---------------------------------------------------------------------------
 
-/// @brief Opens an archive from disk. Detects `_dir.avv` suffix for AVV3
+/// @brief Opens an archive from disk. Detects `_dir.avv` suffix for AVV5
 ///        split sets and populates chunk_dir_ / chunk_stem_ accordingly.
 Result<void> ArchiveReader::open(const std::filesystem::path &archive_file) {
   if (!std::filesystem::exists(archive_file) ||
@@ -62,10 +62,13 @@ Result<void> ArchiveReader::open(const std::filesystem::path &archive_file) {
     ArchiveHeader hdr;
     hash_in.read(reinterpret_cast<char *>(&hdr), sizeof(hdr));
     const std::string_view magic_sv(hdr.magic, 4);
-    if (magic_sv != "AVV1" && magic_sv != "AVV2" && magic_sv != "AVV3") {
+    if (magic_sv != "AVV4" && magic_sv != "AVV5") {
       return vfs::unexpected<ErrorCode>(ErrorCode::InvalidMagic);
     }
-    uint64_t expected = from_disk64(hdr.reserved);
+
+    default_compression_level_ = hdr.default_compression_level;
+
+    uint64_t expected = from_disk64(hdr.directory_hash);
     if (expected != 0) {
       char buf[8192];
       Fnv1a64 hasher;
@@ -88,8 +91,8 @@ Result<void> ArchiveReader::open(const std::filesystem::path &archive_file) {
 // read_central_directory
 // ---------------------------------------------------------------------------
 
-/// @brief Parses the archive footer and central directory. Handles V1/V2
-///        (28-byte CDE) and V3 (32-byte CDE with chunk_index) formats.
+/// @brief Parses the archive footer and central directory. Handles V4
+///        (28-byte CDE) and V5 (32-byte CDE with chunk_index) formats.
 Result<void> ArchiveReader::read_central_directory() {
   std::ifstream in(archive_path_, std::ios::binary);
   if (!in)
@@ -98,11 +101,11 @@ Result<void> ArchiveReader::read_central_directory() {
   ArchiveHeader header;
   in.read(reinterpret_cast<char *>(&header), sizeof(header));
   const std::string_view magic_sv(header.magic, 4);
-  if (!in || (magic_sv != "AVV1" && magic_sv != "AVV2" && magic_sv != "AVV3"))
+  if (!in || (magic_sv != "AVV4" && magic_sv != "AVV5"))
     return vfs::unexpected<ErrorCode>(ErrorCode::InvalidMagic);
 
   const uint32_t version = from_disk32(header.version);
-  if (version < 1 || version > 3)
+  if (version != 4 && version != 5)
     return vfs::unexpected<ErrorCode>(ErrorCode::UnsupportedVersion);
 
   in.seekg(-static_cast<std::streamoff>(sizeof(ArchiveFooter)), std::ios::end);
@@ -114,8 +117,7 @@ Result<void> ArchiveReader::read_central_directory() {
   in.read(reinterpret_cast<char *>(&footer), sizeof(footer));
 
   const std::string_view eof_magic(footer.magic_end, 8);
-  if (!in || (eof_magic != "1VVA_EOF" && eof_magic != "2VVA_EOF" &&
-              eof_magic != "3VVA_EOF"))
+  if (!in || (eof_magic != "4VVA_EOF" && eof_magic != "5VVA_EOF"))
     return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);
 
   const uint64_t dir_offset = from_disk64(footer.directory_offset);
@@ -129,7 +131,7 @@ Result<void> ArchiveReader::read_central_directory() {
   entries_.clear();
 
   while (bytes_read < directory_size) {
-    if (version <= 2) {
+    if (version == 4) {
       CentralDirectoryEntryBase base;
       in.read(reinterpret_cast<char *>(&base), sizeof(base));
       if (!in)
@@ -205,15 +207,16 @@ read_entry_data(const ArchiveReader::FileEntry &entry,
   if (!in.read(comp.data(), static_cast<std::streamsize>(comp.size())))
     return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);
 
-  if (entry.flags & (0x04 | 0x08)) {
+  const CipherAlgorithm cipher = cde_cipher_id(entry.flags);
+  if (cipher != CipherAlgorithm::None) {
     if (password.empty())
       return vfs::unexpected<ErrorCode>(ErrorCode::DecryptionFailed);
 
     std::span<uint8_t> data_span(reinterpret_cast<uint8_t *>(comp.data()),
                                  comp.size());
-    if (entry.flags & 0x04) {
+    if (cipher == CipherAlgorithm::Xor) {
       CryptoUtils::xor_cipher(data_span, password, 0);
-    } else if (entry.flags & 0x08) {
+    } else if (cipher == CipherAlgorithm::Aes256Ctr) {
       if (comp.size() < 16)
         return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);
       std::vector<uint8_t> iv(16);
@@ -226,7 +229,7 @@ read_entry_data(const ArchiveReader::FileEntry &entry,
     }
   }
 
-  if (entry.flags & 0x01) {
+  if (cde_is_lz4(entry.flags)) {
     LZ4F_dctx *dctx = nullptr;
     if (LZ4F_isError(LZ4F_createDecompressionContext(&dctx, LZ4F_VERSION)))
       return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);

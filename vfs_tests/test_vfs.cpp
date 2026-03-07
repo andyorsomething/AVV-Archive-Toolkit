@@ -4,9 +4,9 @@
  *
  * Covers:
  *  - Endianness helpers
- *  - Single-file AVV2 pack/unpack round-trip
+ *  - Single-file AVV4 pack/unpack round-trip
  *  - LZ4HC compression correctness and fallback
- *  - Split AVV3 pack/unpack round-trip (single and multi-chunk)
+ *  - Split AVV5 pack/unpack round-trip (single and multi-chunk)
  *  - Single-file extraction APIs (extract_file, read_file_data)
  *  - Error handling: bad magic, truncated file, unsupported version,
  *    missing file, zero-size entry, FileNotFound on missing path
@@ -62,14 +62,14 @@ TEST_CASE("Endianness helpers", "[vfs_types]") {
 }
 
 // ===========================================================================
-// AVV2 — Single-file pack / unpack
+// AVV4 — Single-file pack / unpack
 // ===========================================================================
 
 /**
- * @brief Full AVV2 round-trip: pack a two-file directory, verify entry count,
+ * @brief Full AVV4 round-trip: pack a two-file directory, verify entry count,
  *        unpack, and compare file contents byte-for-byte.
  */
-TEST_CASE("AVV2 Pack and Unpack Roundtrip", "[vfs_core]") {
+TEST_CASE("AVV4 Pack and Unpack Roundtrip", "[vfs_core]") {
   const std::filesystem::path test_dir = "rt2_in";
   const std::filesystem::path out_dir = "rt2_out";
   const std::filesystem::path archive = "rt2.avv";
@@ -170,14 +170,14 @@ TEST_CASE("LZ4HC Compression Flag and Roundtrip", "[vfs_core]") {
 }
 
 // ===========================================================================
-// AVV3 Split — Single chunk (all files fit in one chunk)
+// AVV5 Split — Single chunk (all files fit in one chunk)
 // ===========================================================================
 
 /**
  * @brief Verifies that pack_directory_split produces a _dir.avv file plus at
  *        least one _000.avv chunk file, and that unpack_all restores content.
  */
-TEST_CASE("AVV3 Split Pack Roundtrip - Single Chunk", "[vfs_core][split]") {
+TEST_CASE("AVV5 Split Pack Roundtrip - Single Chunk", "[vfs_core][split]") {
   const std::filesystem::path test_dir = "sp1_in";
   const std::filesystem::path out_dir = "sp1_out";
   const std::string stem = "sp1_archive";
@@ -219,7 +219,7 @@ TEST_CASE("AVV3 Split Pack Roundtrip - Single Chunk", "[vfs_core][split]") {
 }
 
 // ===========================================================================
-// AVV3 Split — Forced multi-chunk rollover
+// AVV5 Split — Forced multi-chunk rollover
 // ===========================================================================
 
 /**
@@ -227,7 +227,7 @@ TEST_CASE("AVV3 Split Pack Roundtrip - Single Chunk", "[vfs_core][split]") {
  *        Verifies each file gets a distinct chunk_index and that all
  *        payloads decompress correctly.
  */
-TEST_CASE("AVV3 Split Pack Roundtrip - Multi Chunk", "[vfs_core][split]") {
+TEST_CASE("AVV5 Split Pack Roundtrip - Multi Chunk", "[vfs_core][split]") {
   const std::filesystem::path test_dir = "sp2_in";
   const std::filesystem::path out_dir = "sp2_out";
   const std::string stem = "sp2_archive";
@@ -292,14 +292,14 @@ TEST_CASE("AVV3 Split Pack Roundtrip - Multi Chunk", "[vfs_core][split]") {
 }
 
 // ===========================================================================
-// AVV3 Split — read_file_data and extract_file APIs
+// AVV5 Split — read_file_data and extract_file APIs
 // ===========================================================================
 
 /**
  * @brief Verifies that the single-file read/extract APIs work correctly
- *        against an AVV3 split archive, including FileNotFound for bad paths.
+ *        against an AVV5 split archive, including FileNotFound for bad paths.
  */
-TEST_CASE("AVV3 Split Single-File API", "[vfs_core][split]") {
+TEST_CASE("AVV5 Split Single-File API", "[vfs_core][split]") {
   const std::filesystem::path test_dir = "sp3_in";
   const std::string stem = "sp3_archive";
   const std::string dir_avv = stem + "_dir.avv";
@@ -309,7 +309,7 @@ TEST_CASE("AVV3 Split Single-File API", "[vfs_core][split]") {
   std::filesystem::remove(stem + "_000.avv");
   std::filesystem::create_directories(test_dir);
 
-  const std::string content = "Single-file API test payload for AVV3.";
+  const std::string content = "Single-file API test payload for AVV5.";
   write_file(test_dir / "payload.txt", content);
 
   ArchiveWriter writer;
@@ -388,14 +388,14 @@ TEST_CASE("Error Handling - Pack Missing Directory", "[vfs_core]") {
 }
 
 /**
- * @brief An archive with a valid AVV2 magic but unsupported version number
+ * @brief An archive with a valid AVV4 magic but unsupported version number
  *        is rejected with UnsupportedVersion.
  */
 TEST_CASE("Error Handling - Unsupported Version", "[vfs_core]") {
   const std::filesystem::path f = "bad_version.avv";
   {
     std::ofstream out(f, std::ios::binary);
-    ArchiveHeader header; // default: magic="AVV2", version=2
+    ArchiveHeader header; // default: magic="AVV4", version=4
     header.version = to_disk32(999);
     out.write(reinterpret_cast<const char *>(&header), sizeof(header));
   }
@@ -407,7 +407,7 @@ TEST_CASE("Error Handling - Unsupported Version", "[vfs_core]") {
 }
 
 /**
- * @brief A file containing only an AVV2 header (no footer) is rejected
+ * @brief A file containing only an AVV4 header (no footer) is rejected
  *        with CorruptedArchive.
  */
 TEST_CASE("Error Handling - Truncated Archive", "[vfs_core]") {
@@ -458,9 +458,9 @@ TEST_CASE("Zero-Size File Roundtrip", "[vfs_core]") {
 }
 
 /**
- * @brief Single-file extraction APIs (AVV2): read_file_data and extract_file.
+ * @brief Single-file extraction APIs (AVV4): read_file_data and extract_file.
  */
-TEST_CASE("AVV2 Single-File Extraction APIs", "[vfs_core]") {
+TEST_CASE("AVV4 Single-File Extraction APIs", "[vfs_core]") {
   const std::filesystem::path test_dir = "api2_in";
   const std::filesystem::path archive = "api2.avv";
 
@@ -468,7 +468,7 @@ TEST_CASE("AVV2 Single-File Extraction APIs", "[vfs_core]") {
   std::filesystem::remove(archive);
   std::filesystem::create_directories(test_dir);
 
-  const std::string content = "AVV2 single-file extraction payload.";
+  const std::string content = "AVV4 single-file extraction payload.";
   write_file(test_dir / "payload.txt", content);
 
   ArchiveWriter writer;
@@ -689,7 +689,7 @@ TEST_CASE("Journaling Resume Roundtrip", "[vfs_core][journal]") {
 // Append File Tests
 // ===========================================================================
 
-TEST_CASE("AVV2 Append File Roundtrip", "[vfs_core][append]") {
+TEST_CASE("AVV4 Append File Roundtrip", "[vfs_core][append]") {
   const std::filesystem::path test_dir = "append_in";
   const std::filesystem::path out_dir = "append_out";
   const std::filesystem::path archive = "append.avv";
@@ -758,7 +758,7 @@ TEST_CASE("Append File Error Handling", "[vfs_core][append]") {
   }
 }
 
-TEST_CASE("AVV2 Append Encrypted File", "[vfs_core][append][crypto]") {
+TEST_CASE("AVV4 Append Encrypted File", "[vfs_core][append][crypto]") {
   const std::filesystem::path test_dir = "append_crypto_in";
   const std::filesystem::path out_dir = "append_crypto_out";
   const std::filesystem::path archive = "append_crypto.avv";

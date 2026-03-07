@@ -154,6 +154,48 @@ public:
   ErrorCode error() const { return err_; }
 };
 
+/**
+ * @brief Identifies the per-file cipher used in an AVV archive entry.
+ *
+ * Stored in bits [11:8] (i.e., the upper nibble of the low byte of `flags`
+ * in the CDE).  Values 0x3–0xF are reserved for future algorithms.
+ */
+enum class CipherAlgorithm : uint8_t {
+  None = 0x0,      ///< No encryption.
+  Xor = 0x1,       ///< XOR cipher (debug/legacy use only).
+  Aes256Ctr = 0x2, ///< AES-256 in CTR mode with a prepended 16-byte IV.
+};
+
+/// @brief CDE flags bit definition: bit 0 = LZ4 frame compressed.
+constexpr uint16_t CDE_FLAG_LZ4 = 0x0001u;
+/// @brief CDE flags shift for the 4-bit CipherAlgorithm discriminant (bits
+/// [11:8]).
+constexpr uint16_t CDE_CIPHER_SHIFT = 8u;
+/// @brief CDE flags mask that isolates the CipherAlgorithm nibble.
+constexpr uint16_t CDE_CIPHER_MASK = 0x0F00u;
+
+/// @brief Extracts the compression flag from a CDE flags word.
+[[nodiscard]] inline constexpr bool cde_is_lz4(uint16_t flags) noexcept {
+  return (flags & CDE_FLAG_LZ4) != 0;
+}
+
+/// @brief Extracts the CipherAlgorithm discriminant from a CDE flags word.
+[[nodiscard]] inline constexpr CipherAlgorithm
+cde_cipher_id(uint16_t flags) noexcept {
+  return static_cast<CipherAlgorithm>((flags & CDE_CIPHER_MASK) >>
+                                      CDE_CIPHER_SHIFT);
+}
+
+/// @brief Constructs a CDE flags word from its components.
+/// @param lz4    True if the payload is LZ4-compressed.
+/// @param cipher The encryption algorithm in use.
+[[nodiscard]] inline constexpr uint16_t
+cde_make_flags(bool lz4, CipherAlgorithm cipher) noexcept {
+  return static_cast<uint16_t>(
+      (lz4 ? CDE_FLAG_LZ4 : 0u) |
+      (static_cast<uint16_t>(cipher) << CDE_CIPHER_SHIFT));
+}
+
 #pragma pack(push, 1)
 
 /**
@@ -162,19 +204,33 @@ public:
 struct ArchiveHeader {
   char magic[4] = {
       'A', 'V', 'V',
-      '2'}; ///< Four-byte identifier. Must equal "AVV2" for version 2 archives.
-  uint32_t version = 2;  ///< Archive format version. Currently 2.
-  uint64_t reserved = 0; ///< Reserved for future use; must be zero.
+      '4'}; ///< Four-byte identifier. "AVV4" for single, "AVV5" for split.
+  uint32_t version = 4;        ///< Archive format version. Currently 4.
+  uint64_t directory_hash = 0; ///< Integrity hash of the directory block.
+  uint8_t default_compression_level =
+      3;                    ///< Default LZ4 compression level (1-12).
+  uint8_t padding[7] = {0}; ///< Reserved padding to maintain 8-byte alignment.
 };
-static_assert(sizeof(ArchiveHeader) == 16, "Header size mismatch");
+static_assert(sizeof(ArchiveHeader) == 24, "Header size mismatch");
 
 /**
- * @brief Central Directory entry on-disk base struct (AVV version 1 and 2).
+ * @brief Central Directory entry on-disk base struct (AVV version 4).
  * Note: Immediately following this struct in binary format is the path string.
  */
 struct CentralDirectoryEntryBase {
   uint16_t path_length;
-  uint16_t flags;           ///< Bitmask. 0x01=LZ4, 0x04=XOR, 0x08=AES.
+  /**
+   * @brief Per-file flags (little-endian on disk).
+   *
+   * Bit layout:
+   *   [0]     — 1 = LZ4 Frame compressed  (CDE_FLAG_LZ4)
+   *   [7:1]   — Reserved, must be zero
+   *   [11:8]  — CipherAlgorithm discriminant  (CDE_CIPHER_MASK >>
+   * CDE_CIPHER_SHIFT) [15:12] — Reserved, must be zero
+   *
+   * Use cde_is_lz4(), cde_cipher_id(), and cde_make_flags() to read/write.
+   */
+  uint16_t flags;
   uint64_t size_offset;     ///< Byte offset of the file data in the archive.
   uint64_t size;            ///< Uncompressed size in bytes.
   uint64_t compressed_size; ///< On-disk size (compressed or equal to size).
@@ -183,16 +239,20 @@ static_assert(sizeof(CentralDirectoryEntryBase) == 28,
               "CDE base size mismatch");
 
 /**
- * @brief Central Directory entry on-disk base struct for AVV version 3.
+ * @brief Central Directory entry on-disk base struct for AVV version 5.
  *
- * Extends V2 with a `chunk_index` field that identifies which data chunk file
+ * Extends V4 with a `chunk_index` field that identifies which data chunk file
  * (`_000.avv`, `_001.avv`, ...) the file's payload resides in.
  * A `chunk_index` of 0xFFFF is reserved and must not be used.
- * In a non-split (single-file) V3 archive, `chunk_index` is always 0.
+ * In a non-split (single-file) V5 archive, `chunk_index` is always 0.
  */
 struct CentralDirectoryEntryBaseV3 {
   uint16_t path_length;
-  uint16_t flags;           ///< Bitmask. 0x01=LZ4, 0x04=XOR, 0x08=AES.
+  /**
+   * @brief Per-file flags — same layout as CentralDirectoryEntryBase::flags.
+   * Use cde_is_lz4(), cde_cipher_id(), and cde_make_flags() to read/write.
+   */
+  uint16_t flags;
   uint16_t chunk_index;     ///< Which _NNN data chunk this file lives in.
   uint16_t _reserved;       ///< Padding — must be zero.
   uint64_t size_offset;     ///< Byte offset within the chunk file.
@@ -208,7 +268,7 @@ static_assert(sizeof(CentralDirectoryEntryBaseV3) == 32,
  */
 struct ArchiveFooter {
   uint64_t directory_offset;
-  char magic_end[8] = {'2', 'V', 'V', 'A', '_', 'E', 'O', 'F'};
+  char magic_end[8] = {'4', 'V', 'V', 'A', '_', 'E', 'O', 'F'};
 };
 static_assert(sizeof(ArchiveFooter) == 16, "Footer size mismatch");
 

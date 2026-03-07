@@ -11,7 +11,7 @@ This project was developed collaboratively with AI coding assistants as a portfo
 
 | Area | AI Contribution |
 |---|---|
-| Architecture | Designed `.avv` binary format (V1-V3), central directory layout, and split-file VPK-style architecture |
+| Architecture | Designed `.avv` binary format (V1-V5), central directory layout, and split-file VPK-style architecture |
 | Core Library | Generated `ArchiveWriter`, `ArchiveReader`, endianness helpers, and `Result<T>` pattern |
 | Cryptography | Implemented FNV-1a hashing and AES-256-CTR encryption support bridging tiny-AES-c |
 | LZ4 Integration | Integrated LZ4HC level 1-12 frame compression with automatic raw storage fallback |
@@ -28,8 +28,11 @@ This project was developed collaboratively with AI coding assistants as a portfo
 - Reviewed every generated file and found/fixed subtle bugs (Ctrl+O scope, sort ordering, null-term)
 - Managed the Visual Studio solution structure and project GUIDs
 - Debugged build configuration issues (duplicate `main()`, missing include paths)
-- Finalized AVV3 split archive design and chunk naming convention
+- Finalized AVV5 split archive design and chunk naming convention
 - Validated performance of the ImGuiListClipper hex dump on large archives
+- Identified critical AES-CTR keystream desynchronization vulnerabilities in the initial stream-offset simulation
+- Pushed for robust future-proofing by moving CDE compression flags into a dedicated `CipherAlgorithm` enumeration
+- Enforced actual decryption validation in the Virtual File Browser to prevent misleading UI states
 
 ## Lessons Learned
 

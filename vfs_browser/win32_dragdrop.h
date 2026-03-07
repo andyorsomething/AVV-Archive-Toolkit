@@ -126,6 +126,10 @@ public:
   }
   HRESULT STDMETHODCALLTYPE
   EnumFormatEtc(DWORD dwDirection, IEnumFORMATETC **ppenumFormatEtc) override {
+    if (dwDirection == DATADIR_GET) {
+      FORMATETC fmt = {CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+      return SHCreateStdEnumFmtEtc(1, &fmt, ppenumFormatEtc);
+    }
     return E_NOTIMPL;
   }
   HRESULT STDMETHODCALLTYPE DAdvise(FORMATETC *pformatetc, DWORD advf,
@@ -146,16 +150,18 @@ public:
  * @param win_path Absolute wide-string path to the file on disk to be dragged.
  */
 inline void Win32DoDragDrop(const std::wstring &win_path) {
-  OleInitialize(nullptr);
-  {
+  HRESULT hrOle = OleInitialize(nullptr);
+  if (SUCCEEDED(hrOle) || hrOle == RPC_E_CHANGED_MODE) {
     DropSource *src = new DropSource();
     DataObjectDrop *data = new DataObjectDrop(win_path);
     DWORD effect = 0;
     DoDragDrop(data, src, DROPEFFECT_COPY, &effect);
     src->Release();
     data->Release();
+    if (SUCCEEDED(hrOle)) {
+      OleUninitialize();
+    }
   }
-  OleUninitialize();
 }
 
 #endif

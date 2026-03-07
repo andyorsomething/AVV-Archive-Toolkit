@@ -77,23 +77,73 @@ void CryptoUtils::aes256_ctr_cipher(std::span<uint8_t> data,
   if (key.size() != 32 || iv.size() != 16 || data.empty())
     return;
 
-  struct AES_ctx ctx;
-  AES_init_ctx_iv(&ctx, key.data(), iv.data());
+  // Copy the IV so we can mutate it to simulate seeking.
+  uint8_t working_iv[16];
+  std::memcpy(working_iv, iv.data(), 16);
 
-  // Simulate skip by advancing the CTR cipher
-  if (offset > 0) {
-    uint8_t dummy[4096];
-    uint64_t remaining = offset;
-    while (remaining > 0) {
-      uint32_t step = static_cast<uint32_t>(
-          remaining > sizeof(dummy) ? sizeof(dummy) : remaining);
-      std::memset(dummy, 0, step);
-      AES_CTR_xcrypt_buffer(&ctx, dummy, step);
-      remaining -= step;
+  // -----------------------------------------------------------------------
+  // Step 1: Advance the IV counter arithmetically.
+  //
+  // tiny-aes-c increments ctx->Iv as a big-endian 128-bit counter at the
+  // END of each 16-byte block. To seek to byte `offset`, we need the
+  // counter value that tiny-aes-c will have AFTER processing the blocks
+  // before `offset`, which is simply `offset / 16` increments.
+  //
+  // We replicate the same big-endian increment loop used in aes.c.
+  // This is O(1) regardless of offset magnitude.
+  // -----------------------------------------------------------------------
+  const uint64_t blocks_to_skip = offset / 16;
+  for (uint64_t n = 0; n < blocks_to_skip; ++n) {
+    for (int k = 15; k >= 0; --k) {
+      if (++working_iv[k] != 0)
+        break;
     }
   }
 
-  AES_CTR_xcrypt_buffer(&ctx, data.data(), static_cast<uint32_t>(data.size()));
+  struct AES_ctx ctx;
+  AES_init_ctx_iv(&ctx, key.data(), working_iv);
+
+  uint8_t *ptr = data.data();
+  uint64_t remaining = data.size();
+
+  // -----------------------------------------------------------------------
+  // Step 2: Handle a partial leading block if offset is not 16-byte aligned.
+  //
+  // tiny-aes-c has no "start from mid-block" API; we must generate a full
+  // keystream block and skip the bytes that correspond to positions before
+  // our offset. At most 15 bytes are discarded this way.
+  // -----------------------------------------------------------------------
+  const uint64_t intra_block = offset % 16;
+  if (intra_block != 0) {
+    uint8_t block[16] = {};
+    AES_CTR_xcrypt_buffer(&ctx, block, 16);
+
+    // The first `intra_block` bytes of `block` belong to the previous region;
+    // XOR only the tail (up to 16 - intra_block bytes) against our payload.
+    const uint64_t usable = 16 - intra_block;
+    const uint64_t to_xor = (remaining < usable) ? remaining : usable;
+    for (uint64_t i = 0; i < to_xor; ++i)
+      ptr[i] ^= block[intra_block + i];
+
+    ptr += to_xor;
+    remaining -= to_xor;
+  }
+
+  // -----------------------------------------------------------------------
+  // Step 3: Process remaining data in 1 GiB aligned chunks.
+  //
+  // 1 GiB (1 << 30) is a clean multiple of 16, so the block counter inside
+  // tiny-aes-c is always at a block boundary when each chunk call ends. This
+  // prevents counter drift across chunk calls, which the old 0xFFFFFFFF cap
+  // (a value that is 15 mod 16) would have caused for >4 GB payloads.
+  // -----------------------------------------------------------------------
+  constexpr uint64_t MAX_CHUNK = 1ULL * 1024 * 1024 * 1024; // exactly 1 GiB
+  while (remaining > 0) {
+    const uint64_t step = (remaining > MAX_CHUNK) ? MAX_CHUNK : remaining;
+    AES_CTR_xcrypt_buffer(&ctx, ptr, static_cast<uint32_t>(step));
+    ptr += step;
+    remaining -= step;
+  }
 }
 
 } // namespace vfs

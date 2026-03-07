@@ -71,28 +71,29 @@ struct DirectoryNode {
  * @brief Central application state shared across all VFB UI panels.
  */
 struct AppState {
-  /// @brief Heap-allocated reader so it can be safely re-created on new open().
   std::unique_ptr<vfs::ArchiveReader> reader =
       std::make_unique<vfs::ArchiveReader>();
-  bool archive_open = false; ///< True once an archive is successfully opened.
-  std::string archive_path_str; ///< Display path for the status bar.
 
-  std::optional<vfs::ArchiveReader::FileEntry>
-      selected_entry; ///< Currently selected file.
-  std::vector<char>
-      preview_data; ///< Raw bytes of the selected file (plus \0 sentinel).
-  std::string drag_out_pending; ///< Filename pending extraction and drag out.
-  char search_buf[256] = {};    ///< Text filter for the explorer table.
-  char global_password[128] =
-      {}; ///< Decryption password if archive is encrypted.
-  char status_msg[512] = "No archive open."; ///< Persistent status bar text.
+  bool archive_open = false;
+  bool archive_encrypted = false;
+  bool password_verified = false;
+  char prev_password[128] = {};
+  std::string archive_path_str;
 
-  GLuint preview_texture = 0; ///< OpenGL texture ID for the image preview.
-  int preview_width = 0;      ///< Width of the decoded preview image.
-  int preview_height = 0;     ///< Height of the decoded preview image.
+  std::optional<vfs::ArchiveReader::FileEntry> selected_entry;
+  std::vector<char> preview_data;
+  std::string drag_out_pending;
+  char search_buf[256] = {};
+  char global_password[128] = {};
+  char status_msg[512] = "No archive open.";
+  bool open_dialog_requested = false;
 
-  std::unique_ptr<DirectoryNode> root_dir; ///< Virtual directory tree root.
-  DirectoryNode *current_dir = nullptr;    ///< Current active directory.
+  GLuint preview_texture = 0;
+  int preview_width = 0;
+  int preview_height = 0;
+
+  std::unique_ptr<DirectoryNode> root_dir;
+  DirectoryNode *current_dir = nullptr;
 
   // ---- Extraction progress state ----
   std::atomic<bool> extracting{false};
@@ -107,6 +108,8 @@ struct AppState {
   void open(const std::string &path) {
     reader = std::make_unique<vfs::ArchiveReader>(); // fresh instance
     archive_open = false;
+    password_verified = false;
+    std::memset(prev_password, 0, sizeof(prev_password));
     selected_entry.reset();
     preview_data.clear();
 
@@ -116,6 +119,15 @@ struct AppState {
       archive_path_str = path;
       std::snprintf(status_msg, sizeof(status_msg), "Opened: %s  (%zu files)",
                     path.c_str(), reader->get_entries().size());
+
+      // Detect whether any entry in the archive is encrypted.
+      archive_encrypted = false;
+      for (const auto &e : reader->get_entries()) {
+        if (vfs::cde_cipher_id(e.flags) != vfs::CipherAlgorithm::None) {
+          archive_encrypted = true;
+          break;
+        }
+      }
 
       root_dir = std::make_unique<DirectoryNode>();
       root_dir->name = "<root>";
@@ -269,6 +281,16 @@ static bool render_menu_bar(AppState &state, bool &show_hex) {
         auto out = std::filesystem::current_path() / "extracted";
         state.start_extract_all(out);
       }
+      if (state.archive_open && ImGui::MenuItem("Close Archive")) {
+        state.reader = std::make_unique<vfs::ArchiveReader>();
+        state.archive_open = false;
+        state.selected_entry.reset();
+        state.preview_data.clear();
+        state.root_dir.reset();
+        state.current_dir = nullptr;
+        std::snprintf(state.status_msg, sizeof(state.status_msg),
+                      "Archive closed.");
+      }
       ImGui::Separator();
       if (ImGui::MenuItem("Exit", "Alt+F4"))
         quit = true;
@@ -281,16 +303,64 @@ static bool render_menu_bar(AppState &state, bool &show_hex) {
     if (state.archive_open) {
       ImGui::Spacing();
       ImGui::Spacing();
+
+      if (std::strcmp(state.prev_password, state.global_password) != 0) {
+        state.password_verified = false;
+        std::memcpy(state.prev_password, state.global_password,
+                    sizeof(state.global_password));
+      }
+
       ImGui::SetNextItemWidth(150.f);
-      ImGui::InputTextWithHint(
-          "##global_pass", "Password...", state.global_password,
-          sizeof(state.global_password), ImGuiInputTextFlags_Password);
+      if (ImGui::InputTextWithHint("##global_pass", "Password...",
+                                   state.global_password,
+                                   sizeof(state.global_password),
+                                   ImGuiInputTextFlags_Password |
+                                       ImGuiInputTextFlags_EnterReturnsTrue)) {
+        state.password_verified = false;
+        if (state.archive_encrypted && state.global_password[0] != '\0') {
+          for (const auto &e : state.reader->get_entries()) {
+            if (vfs::cde_cipher_id(e.flags) != vfs::CipherAlgorithm::None) {
+              auto res =
+                  state.reader->read_file_data(e.path, state.global_password);
+              state.password_verified = res.has_value();
+              if (state.password_verified) {
+                std::snprintf(state.status_msg, sizeof(state.status_msg),
+                              "Password verified.");
+              } else {
+                std::snprintf(state.status_msg, sizeof(state.status_msg),
+                              "Wrong password.");
+              }
+              break;
+            }
+          }
+        }
+      }
 
       float avail = ImGui::GetContentRegionAvail().x;
       ImGui::SameLine(ImGui::GetWindowWidth() - avail);
+      // Show the archive path, then an (Encrypted)/(Decrypted) tag if the
+      // archive contains any ciphered entries.
       ImGui::TextDisabled("%s", state.archive_path_str.c_str());
+      if (state.archive_encrypted) {
+        ImGui::SameLine(0.f, 6.f);
+        if (state.password_verified) {
+          ImGui::PushStyleColor(ImGuiCol_Text,
+                                ImVec4(0.30f, 0.90f, 0.45f, 1.00f)); // green
+          ImGui::TextUnformatted("(Decrypted)");
+        } else {
+          ImGui::PushStyleColor(ImGuiCol_Text,
+                                ImVec4(0.95f, 0.80f, 0.20f, 1.00f)); // amber
+          ImGui::TextUnformatted("(Encrypted)");
+        }
+        ImGui::PopStyleColor();
+      }
     }
     ImGui::EndMainMenuBar();
+  }
+
+  if (state.open_dialog_requested) {
+    ImGui::OpenPopup("##open_dlg");
+    state.open_dialog_requested = false;
   }
 
   // Inline open-archive dialog
@@ -416,7 +486,11 @@ static void render_explorer(AppState &state) {
         ImGui::TableSetColumnIndex(0);
         const bool selected = state.selected_entry.has_value() &&
                               state.selected_entry->path == ep->path;
-        if (ImGui::Selectable(ep->path.c_str(), selected,
+        std::string display_name = ep->path;
+        if (vfs::cde_cipher_id(ep->flags) != vfs::CipherAlgorithm::None) {
+          display_name = "[Encrypted] " + display_name;
+        }
+        if (ImGui::Selectable(display_name.c_str(), selected,
                               ImGuiSelectableFlags_SpanAllColumns |
                                   ImGuiSelectableFlags_AllowDoubleClick)) {
           state.load_preview(*ep);
@@ -430,6 +504,19 @@ static void render_explorer(AppState &state) {
           ImGui::Separator();
           if (ImGui::MenuItem("Copy Path"))
             ImGui::SetClipboardText(ep->path.c_str());
+          if (ImGui::MenuItem("Delete File")) {
+            vfs::ArchiveWriter writer;
+            auto res = writer.delete_file(ep->path, state.archive_path_str);
+            if (res) {
+              std::snprintf(state.status_msg, sizeof(state.status_msg),
+                            "Deleted: %s", ep->path.c_str());
+              state.open(state.archive_path_str);
+            } else {
+              std::snprintf(state.status_msg, sizeof(state.status_msg),
+                            "Delete failed (error %d)",
+                            static_cast<int>(res.error()));
+            }
+          }
           if (ImGui::MenuItem("Extract to CWD")) {
             auto res = state.reader->extract_file(
                 ep->path,
@@ -500,7 +587,11 @@ static void render_explorer(AppState &state) {
             std::filesystem::path(ep->path).filename().string();
         const bool selected = state.selected_entry.has_value() &&
                               state.selected_entry->path == ep->path;
-        if (ImGui::Selectable(filename.c_str(), selected,
+        std::string display_name = filename;
+        if (vfs::cde_cipher_id(ep->flags) != vfs::CipherAlgorithm::None) {
+          display_name = "[Encrypted] " + display_name;
+        }
+        if (ImGui::Selectable(display_name.c_str(), selected,
                               ImGuiSelectableFlags_SpanAllColumns |
                                   ImGuiSelectableFlags_AllowDoubleClick)) {
           state.load_preview(*ep);
@@ -514,6 +605,19 @@ static void render_explorer(AppState &state) {
           ImGui::Separator();
           if (ImGui::MenuItem("Copy Path"))
             ImGui::SetClipboardText(ep->path.c_str());
+          if (ImGui::MenuItem("Delete File")) {
+            vfs::ArchiveWriter writer;
+            auto res = writer.delete_file(ep->path, state.archive_path_str);
+            if (res) {
+              std::snprintf(state.status_msg, sizeof(state.status_msg),
+                            "Deleted: %s", ep->path.c_str());
+              state.open(state.archive_path_str);
+            } else {
+              std::snprintf(state.status_msg, sizeof(state.status_msg),
+                            "Delete failed (error %d)",
+                            static_cast<int>(res.error()));
+            }
+          }
           if (ImGui::MenuItem("Extract to CWD")) {
             auto res = state.reader->extract_file(
                 ep->path, std::filesystem::current_path() / filename,
@@ -747,16 +851,41 @@ int main(int argc, char **argv) {
           vfs::ArchiveWriter writer;
           vfs::EncryptionOptions enc;
           if (state.global_password[0] != '\0') {
-            enc.algorithm = vfs::EncryptionAlgorithm::Aes256Ctr;
+            enc.algorithm =
+                vfs::EncryptionAlgorithm::Aes256Ctr; // Default if none found
+            for (const auto &e : state.reader->get_entries()) {
+              if (e.flags & 0x04) {
+                enc.algorithm = vfs::EncryptionAlgorithm::Xor;
+                break;
+              }
+              if (e.flags & 0x08) {
+                enc.algorithm = vfs::EncryptionAlgorithm::Aes256Ctr;
+                break;
+              }
+            }
             enc.key = state.global_password;
           }
+          std::string virtual_path = dropped_path.filename().string();
+          if (state.current_dir && state.current_dir->parent) {
+            std::vector<std::string> parts;
+            auto curr = state.current_dir;
+            while (curr && curr->parent) {
+              parts.push_back(curr->name);
+              curr = curr->parent;
+            }
+            std::reverse(parts.begin(), parts.end());
+            virtual_path = "";
+            for (const auto &p : parts)
+              virtual_path += p + "/";
+            virtual_path += dropped_path.filename().string();
+          }
+
           auto res = writer.append_file(
-              dropped_path, dropped_path.filename().string(),
-              state.archive_path_str, vfs::DEFAULT_COMPRESSION_LEVEL, enc);
+              dropped_path, virtual_path, state.archive_path_str,
+              state.reader->get_default_compression_level(), enc);
           if (res) {
             std::snprintf(state.status_msg, sizeof(state.status_msg),
-                          "Appended: %s",
-                          dropped_path.filename().string().c_str());
+                          "Appended: %s", virtual_path.c_str());
             state.open(state.archive_path_str); // Refresh the view
           } else {
             std::snprintf(state.status_msg, sizeof(state.status_msg),
@@ -778,7 +907,7 @@ int main(int argc, char **argv) {
     ImGui::NewFrame();
 
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O, false))
-      ImGui::OpenPopup("##open_dlg");
+      state.open_dialog_requested = true;
 
     // Full-window dockspace
     ImGuiViewport *vp = ImGui::GetMainViewport();

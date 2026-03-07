@@ -8,11 +8,15 @@
 
 namespace vfs {
 
-enum class EncryptionAlgorithm { None, Xor, Aes256Ctr };
+/// @brief Alias for CipherAlgorithm. Specifies the cipher for pack/append.
+/// Values: None, Xor, Aes256Ctr — defined in vfs_types.h.
+using EncryptionAlgorithm = CipherAlgorithm;
 
+/// @brief Options for encrypting files during pack or append operations.
 struct EncryptionOptions {
-  EncryptionAlgorithm algorithm = EncryptionAlgorithm::None;
-  std::string key;
+  EncryptionAlgorithm algorithm =
+      EncryptionAlgorithm::None; ///< The cipher to use.
+  std::string key; ///< Plaintext password; key bytes are derived via FNV-1a.
 };
 
 /// @brief Default LZ4 compression level. Level 3 is the fastest LZ4-fast
@@ -35,12 +39,15 @@ using ProgressCallback = std::function<void(uint32_t current, uint32_t total,
  */
 class ArchiveWriter {
 public:
+  /// @brief Constructs a new ArchiveWriter instance.
   ArchiveWriter();
+
+  /// @brief Destroys the ArchiveWriter instance.
   ~ArchiveWriter();
   ArchiveWriter(const ArchiveWriter &) = delete;
   ArchiveWriter &operator=(const ArchiveWriter &) = delete;
 
-  /// @brief Packs into a single AVV2 archive.
+  /// @brief Packs into a single AVV4 archive.
   [[nodiscard]] Result<void>
   pack_directory(const std::filesystem::path &input_dir,
                  const std::filesystem::path &output_file,
@@ -49,7 +56,7 @@ public:
                  const EncryptionOptions &encryption = {},
                  bool enable_journal = true);
 
-  /// @brief Appends a single file to an existing AVV2 single-file archive.
+  /// @brief Appends a single file to an existing AVV4 single-file archive.
   /// @param source_file    Path to the raw file on the OS disk.
   /// @param virtual_path   The path/name the file will have inside the archive.
   /// @param archive_file   The existing .avv archive to modify.
@@ -62,7 +69,14 @@ public:
               int compression_level = DEFAULT_COMPRESSION_LEVEL,
               const EncryptionOptions &encryption = {});
 
-  /// @brief Packs into a VPK-style split AVV3 archive set.
+  /// @brief Deletes a single file from an existing AVV4 archive.
+  /// @param virtual_path   The path/name of the file to remove.
+  /// @param archive_file   The existing .avv archive to modify.
+  [[nodiscard]] Result<void>
+  delete_file(const std::string &virtual_path,
+              const std::filesystem::path &archive_file);
+
+  /// @brief Packs into a VPK-style split AVV5 archive set.
   [[nodiscard]] Result<void>
   pack_directory_split(const std::filesystem::path &input_dir,
                        const std::filesystem::path &output_stem,
