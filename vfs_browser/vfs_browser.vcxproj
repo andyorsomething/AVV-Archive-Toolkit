@@ -148,6 +148,8 @@
     <ClCompile Include="..\third_party\imgui\backends\imgui_impl_sdl2.cpp" />
     <ClCompile Include="..\third_party\imgui\backends\imgui_impl_opengl3.cpp" />
     <ClCompile Include="..\vfs_core\archive_reader.cpp" />
+    <ClCompile Include="..\vfs_core\archive_reader_win32.cpp" />
+    <ClCompile Include="..\vfs_core\thread_pool.cpp" />
     <ClCompile Include="..\vfs_core\archive_writer.cpp" />
     <ClCompile Include="..\vfs_core\crypto_utils.cpp" />
     <ClCompile Include="..\third_party\lz4\lz4.c" />
@@ -161,6 +163,7 @@
     <ClInclude Include="..\third_party\imgui\backends\imgui_impl_sdl2.h" />
     <ClInclude Include="..\third_party\imgui\backends\imgui_impl_opengl3.h" />
     <ClInclude Include="..\vfs_core\archive_reader.h" />
+    <ClInclude Include="..\vfs_core\thread_pool.h" />
     <ClInclude Include="..\vfs_core\archive_writer.h" />
     <ClInclude Include="..\vfs_core\crypto_utils.h" />
     <ClInclude Include="..\vfs_core\vfs_types.h" />

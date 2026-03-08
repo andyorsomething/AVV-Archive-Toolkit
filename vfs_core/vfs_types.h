@@ -1,3 +1,8 @@
+/**
+ * @file vfs_types.h
+ * @brief Common result, error, flag, and on-disk structure definitions for the
+ * AVV formats.
+ */
 #pragma once
 
 #include <bit>
@@ -23,6 +28,7 @@ enum class ErrorCode {
            ///< read/write).
   PermissionDenied, ///< Insufficient permissions to read or write the target
                     ///< path.
+  ArchiveTooLarge,  ///< The requested archive exceeds a format size limit.
   HashMismatch,     ///< The archive's computed integrity hash does not match
                     ///< the stored hash.
   DecryptionFailed  ///< The file payload could not be decrypted (e.g., wrong
@@ -48,6 +54,8 @@ inline const char *error_code_to_string(ErrorCode code) {
     return "I/O Error";
   case ErrorCode::PermissionDenied:
     return "Permission Denied";
+  case ErrorCode::ArchiveTooLarge:
+    return "Archive Too Large";
   case ErrorCode::HashMismatch:
     return "Hash Mismatch (Integrity Error)";
   case ErrorCode::DecryptionFailed:
@@ -109,11 +117,44 @@ public:
       val_.~T();
   }
 
+  Result(const Result &other) : has_val_(other.has_val_) {
+    if (has_val_)
+      new (&val_) T(other.val_);
+    else
+      err_ = other.err_;
+  }
+
   Result(Result &&other) noexcept : has_val_(other.has_val_) {
     if (has_val_)
       new (&val_) T(std::move(other.val_));
     else
       err_ = other.err_;
+  }
+
+  Result &operator=(const Result &other) {
+    if (this != &other) {
+      if (has_val_)
+        val_.~T();
+      has_val_ = other.has_val_;
+      if (has_val_)
+        new (&val_) T(other.val_);
+      else
+        err_ = other.err_;
+    }
+    return *this;
+  }
+
+  Result &operator=(Result &&other) noexcept {
+    if (this != &other) {
+      if (has_val_)
+        val_.~T();
+      has_val_ = other.has_val_;
+      if (has_val_)
+        new (&val_) T(std::move(other.val_));
+      else
+        err_ = other.err_;
+    }
+    return *this;
   }
 
   /// @brief Returns true if the Result contains a value, false if it contains
@@ -152,13 +193,18 @@ public:
 
   /// @brief Retrieves the error code. Undefined if the operation succeeded.
   ErrorCode error() const { return err_; }
+
+  Result &operator=(const Result &other) = default;
+  Result &operator=(Result &&other) noexcept = default;
+  Result(const Result &other) = default;
+  Result(Result &&other) noexcept = default;
 };
 
 /**
  * @brief Identifies the per-file cipher used in an AVV archive entry.
  *
  * Stored in bits [11:8] (i.e., the upper nibble of the low byte of `flags`
- * in the CDE).  Values 0x3–0xF are reserved for future algorithms.
+ * in the CDE). Values `0x3`-`0xF` are reserved for future algorithms.
  */
 enum class CipherAlgorithm : uint8_t {
   None = 0x0,      ///< No encryption.
@@ -184,6 +230,19 @@ constexpr uint16_t CDE_CIPHER_MASK = 0x0F00u;
 cde_cipher_id(uint16_t flags) noexcept {
   return static_cast<CipherAlgorithm>((flags & CDE_CIPHER_MASK) >>
                                       CDE_CIPHER_SHIFT);
+}
+
+/// @brief Returns true if the extracted CipherAlgorithm is currently supported.
+[[nodiscard]] inline constexpr bool
+cde_cipher_supported(CipherAlgorithm cipher) noexcept {
+  return cipher == CipherAlgorithm::None || cipher == CipherAlgorithm::Xor ||
+         cipher == CipherAlgorithm::Aes256Ctr;
+}
+
+/// @brief Returns true if a CDE flags word contains only currently valid bits.
+[[nodiscard]] inline constexpr bool cde_flags_valid(uint16_t flags) noexcept {
+  return (flags & ~(CDE_FLAG_LZ4 | CDE_CIPHER_MASK)) == 0 &&
+         cde_cipher_supported(cde_cipher_id(flags));
 }
 
 /// @brief Constructs a CDE flags word from its components.

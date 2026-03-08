@@ -24,7 +24,7 @@
     <ProjectGuid>{04b72cba-7c8f-4e1b-9bc3-df0bb1f2cf2d}</ProjectGuid>
     <RootNamespace>virtualFileSystemprogram</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
-    <ProjectName>vfs_packer</ProjectName>
+    <ProjectName>vfs_cli</ProjectName>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
@@ -135,6 +135,8 @@
     <ClCompile Include="..\third_party\tiny-aes-c\aes.c" />
     <ClCompile Include="..\vfs_cli\main.cpp" />
     <ClCompile Include="..\vfs_core\archive_reader.cpp" />
+    <ClCompile Include="..\vfs_core\archive_reader_win32.cpp" />
+    <ClCompile Include="..\vfs_core\thread_pool.cpp" />
     <ClCompile Include="..\vfs_core\archive_writer.cpp" />
     <ClCompile Include="..\vfs_core\crypto_utils.cpp" />
   </ItemGroup>
@@ -145,6 +147,7 @@
     <ClInclude Include="..\third_party\lz4\xxhash.h" />
     <ClInclude Include="..\third_party\tiny-aes-c\aes.h" />
     <ClInclude Include="..\vfs_core\archive_reader.h" />
+    <ClInclude Include="..\vfs_core\thread_pool.h" />
     <ClInclude Include="..\vfs_core\archive_writer.h" />
     <ClInclude Include="..\vfs_core\crypto_utils.h" />
     <ClInclude Include="..\vfs_core\vfs_types.h" />

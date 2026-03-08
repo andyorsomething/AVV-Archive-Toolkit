@@ -1,16 +1,29 @@
+/**
+ * @file archive_reader.h
+ * @brief Public API for reading, extracting, and asynchronously streaming AVV
+ * archives.
+ */
 #pragma once
 
+#include "thread_pool.h"
 #include "vfs_types.h"
+#include <atomic>
 #include <filesystem>
 #include <functional>
+#include <mutex>
+#include <queue>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace vfs {
 
-// Re-export the ProgressCallback so consumers only need archive_reader.h
+/// @brief Re-exported progress callback so consumers only need this header.
 using ProgressCallback = std::function<void(uint32_t current, uint32_t total,
                                             const std::string &path)>;
+
+/// @brief Opaque platform-specific file handle wrapper.
+struct PlatformFileHandle;
 
 /**
  * @class ArchiveReader
@@ -43,28 +56,71 @@ public:
   ArchiveReader &operator=(const ArchiveReader &) = delete;
 
   /// @brief Opens an archive and parses its central directory without loading
-  ///        file payloads. Accepts both single-file .avv and split _dir.avv.
+  ///        file payloads.
+  /// @param archive_file Path to an AVV4 `.avv` file or AVV5 `_dir.avv` file.
+  /// @return `Success` on completion, otherwise a specific `ErrorCode`.
   [[nodiscard]] Result<void> open(const std::filesystem::path &archive_file);
+
+  /// @brief Closes the archive and releases all active file handles.
+  void close();
 
   /// @brief Extracts every file in the archive to @p output_dir, recreating
   ///        the original directory structure. Invokes @p progress (if not null)
   ///        after each file.
+  /// @param output_dir Destination root directory on the host filesystem.
+  /// @param progress Optional callback invoked after each extracted file.
+  /// @param password Optional archive password for encrypted entries.
+  /// @return `Success` on completion, otherwise a specific `ErrorCode`.
   [[nodiscard]] Result<void> unpack_all(const std::filesystem::path &output_dir,
                                         ProgressCallback progress = nullptr,
                                         const std::string &password = "");
 
   /// @brief Extracts a single file identified by @p internal_path to
   ///        @p output_path on the host filesystem.
+  /// @param internal_path Archive-relative path of the entry to extract.
+  /// @param output_path Destination file path on the host filesystem.
+  /// @param password Optional archive password for encrypted entries.
+  /// @return `Success` on completion, otherwise a specific `ErrorCode`.
   [[nodiscard]] Result<void>
   extract_file(const std::string &internal_path,
                const std::filesystem::path &output_path,
                const std::string &password = "");
 
   /// @brief Reads a single file's decompressed bytes into memory.
-  /// @return The raw bytes, or FileNotFound / IOError / CorruptedArchive.
+  /// @param internal_path Archive-relative path of the entry to read.
+  /// @param password Optional archive password for encrypted entries.
+  /// @return The raw bytes on success, or an error result.
   [[nodiscard]] Result<std::vector<char>>
   read_file_data(const std::string &internal_path,
                  const std::string &password = "");
+
+  // --- Async APIs ---
+
+  /// @brief Asynchronously reads a file's decompressed bytes.
+  /// @param internal_path Archive-relative path of the entry to read.
+  /// @param on_complete Completion callback queued for `pump_callbacks()`.
+  /// @param password Optional archive password for encrypted entries.
+  void
+  read_file_async(const std::string &internal_path,
+                  std::function<void(Result<std::vector<char>>)> on_complete,
+                  const std::string &password = "");
+
+  /// @brief Asynchronously extracts a file to disk.
+  /// @param internal_path Archive-relative path of the entry to extract.
+  /// @param output_path Destination file path on the host filesystem.
+  /// @param on_complete Completion callback queued for `pump_callbacks()`.
+  /// @param password Optional archive password for encrypted entries.
+  void extract_file_async(const std::string &internal_path,
+                          const std::filesystem::path &output_path,
+                          std::function<void(Result<void>)> on_complete,
+                          const std::string &password = "");
+
+  /// @brief Warms platform file handles for the chunks referenced by the paths.
+  /// @param internal_paths Archive-relative paths to prefetch.
+  void prefetch_files(const std::vector<std::string> &internal_paths);
+
+  /// @brief Executes completed async callbacks on the calling thread.
+  void pump_callbacks();
 
   /// @brief Returns the parsed central directory entries.
   /// @pre open() must have succeeded.
@@ -84,13 +140,26 @@ private:
   std::filesystem::path chunk_dir_;
   std::string chunk_stem_;
   std::vector<FileEntry> entries_;
+  std::unordered_map<std::string, size_t> entry_lookup_;
   bool is_open_ = false;
   bool is_split_ = false;
   uint8_t default_compression_level_ = 3;
 
+  std::vector<PlatformFileHandle *> platform_handles_;
+  std::mutex handles_mutex_;
+  std::mutex callbacks_mutex_;
+  std::queue<std::function<void()>> completed_tasks_;
+  std::unique_ptr<ThreadPool> thread_pool_;
+
   [[nodiscard]] Result<void> read_central_directory();
+  [[nodiscard]] Result<void> verify_archive_hash() const;
   [[nodiscard]] std::filesystem::path
   chunk_path_for(uint16_t chunk_index) const;
+
+  PlatformFileHandle *get_platform_handle(uint16_t chunk_index);
+
+  /// @brief Closes open platform file handles and resets per-archive metadata.
+  void reset_file_state();
 };
 
 } // namespace vfs

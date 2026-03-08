@@ -21,6 +21,7 @@ class DropSource : public IDropSource {
   LONG m_refCount = 1;
 
 public:
+  /// @brief COM QueryInterface implementation for IDropSource.
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppv) override {
     if (riid == IID_IUnknown || riid == IID_IDropSource) {
       *ppv = this;
@@ -30,15 +31,18 @@ public:
     *ppv = nullptr;
     return E_NOINTERFACE;
   }
+  /// @brief Increments the COM reference count.
   ULONG STDMETHODCALLTYPE AddRef() override {
     return InterlockedIncrement(&m_refCount);
   }
+  /// @brief Decrements the COM reference count and deletes at zero.
   ULONG STDMETHODCALLTYPE Release() override {
     ULONG ref = InterlockedDecrement(&m_refCount);
     if (ref == 0)
       delete this;
     return ref;
   }
+  /// @brief Continues, drops, or cancels the drag based on mouse state.
   HRESULT STDMETHODCALLTYPE QueryContinueDrag(BOOL fEscapePressed,
                                               DWORD grfKeyState) override {
     if (fEscapePressed)
@@ -47,6 +51,7 @@ public:
       return DRAGDROP_S_DROP;
     return S_OK;
   }
+  /// @brief Uses default shell drag cursors.
   HRESULT STDMETHODCALLTYPE GiveFeedback(DWORD dwEffect) override {
     return DRAGDROP_S_USEDEFAULTCURSORS;
   }
@@ -63,8 +68,10 @@ class DataObjectDrop : public IDataObject {
   std::wstring m_file;
 
 public:
+  /// @brief Wraps a single filesystem path as a shell data object.
   DataObjectDrop(const std::wstring &file) : m_file(file) {}
 
+  /// @brief COM QueryInterface implementation for IDataObject.
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppv) override {
     if (riid == IID_IUnknown || riid == IID_IDataObject) {
       *ppv = this;
@@ -74,15 +81,18 @@ public:
     *ppv = nullptr;
     return E_NOINTERFACE;
   }
+  /// @brief Increments the COM reference count.
   ULONG STDMETHODCALLTYPE AddRef() override {
     return InterlockedIncrement(&m_refCount);
   }
+  /// @brief Decrements the COM reference count and deletes at zero.
   ULONG STDMETHODCALLTYPE Release() override {
     ULONG ref = InterlockedDecrement(&m_refCount);
     if (ref == 0)
       delete this;
     return ref;
   }
+  /// @brief Produces a `CF_HDROP` payload for the wrapped path.
   HRESULT STDMETHODCALLTYPE GetData(FORMATETC *pformatetcIn,
                                     STGMEDIUM *pmedium) override {
     if (pformatetcIn->cfFormat == CF_HDROP &&
@@ -107,23 +117,28 @@ public:
     }
     return DV_E_FORMATETC;
   }
+  /// @brief Unsupported for this minimal data object.
   HRESULT STDMETHODCALLTYPE GetDataHere(FORMATETC *pformatetc,
                                         STGMEDIUM *pmedium) override {
     return E_NOTIMPL;
   }
+  /// @brief Reports support for `CF_HDROP`.
   HRESULT STDMETHODCALLTYPE QueryGetData(FORMATETC *pformatetc) override {
     if (pformatetc->cfFormat == CF_HDROP && (pformatetc->tymed & TYMED_HGLOBAL))
       return S_OK;
     return DV_E_FORMATETC;
   }
+  /// @brief Unsupported for this minimal data object.
   HRESULT STDMETHODCALLTYPE GetCanonicalFormatEtc(
       FORMATETC *pformatectIn, FORMATETC *pformatetcOut) override {
     return E_NOTIMPL;
   }
+  /// @brief Unsupported for this minimal data object.
   HRESULT STDMETHODCALLTYPE SetData(FORMATETC *pformatetc, STGMEDIUM *pmedium,
                                     BOOL fRelease) override {
     return E_NOTIMPL;
   }
+  /// @brief Enumerates the single supported format when requested by the shell.
   HRESULT STDMETHODCALLTYPE
   EnumFormatEtc(DWORD dwDirection, IEnumFORMATETC **ppenumFormatEtc) override {
     if (dwDirection == DATADIR_GET) {
@@ -132,14 +147,17 @@ public:
     }
     return E_NOTIMPL;
   }
+  /// @brief Advisory sinks are not supported.
   HRESULT STDMETHODCALLTYPE DAdvise(FORMATETC *pformatetc, DWORD advf,
                                     IAdviseSink *pAdvSink,
                                     DWORD *pdwConnection) override {
     return OLE_E_ADVISENOTSUPPORTED;
   }
+  /// @brief Advisory sinks are not supported.
   HRESULT STDMETHODCALLTYPE DUnadvise(DWORD dwConnection) override {
     return OLE_E_ADVISENOTSUPPORTED;
   }
+  /// @brief Advisory sinks are not supported.
   HRESULT STDMETHODCALLTYPE EnumDAdvise(IEnumSTATDATA **ppenumAdvise) override {
     return OLE_E_ADVISENOTSUPPORTED;
   }

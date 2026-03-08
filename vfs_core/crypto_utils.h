@@ -1,3 +1,7 @@
+/**
+ * @file crypto_utils.h
+ * @brief Hashing and encryption helpers used by archive read/write paths.
+ */
 #pragma once
 
 #include "vfs_types.h"
@@ -9,7 +13,7 @@
 namespace vfs {
 
 /**
- * @brief FNV-1a 64-bit hash calculator for file integrity.
+ * @brief Incremental FNV-1a 64-bit hash calculator used for archive integrity.
  */
 class Fnv1a64 {
   uint64_t hash_ = 0xcbf29ce484222325ULL;
@@ -33,7 +37,7 @@ public:
 };
 
 /**
- * @brief Utility class for encryption and decryption of VFS payloads.
+ * @brief Stateless helpers for encryption key derivation and stream ciphers.
  */
 class CryptoUtils {
 public:

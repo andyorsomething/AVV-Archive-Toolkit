@@ -24,6 +24,39 @@ ArchiveWriter::~ArchiveWriter() = default;
 // Helpers
 // ---------------------------------------------------------------------------
 
+namespace {
+
+ErrorCode map_io_error(const std::error_code &ec) {
+  if (ec == std::errc::no_such_file_or_directory)
+    return ErrorCode::FileNotFound;
+  if (ec == std::errc::permission_denied)
+    return ErrorCode::PermissionDenied;
+  return ErrorCode::IOError;
+}
+
+bool is_safe_archive_entry_path(const std::string &raw_path) {
+  if (raw_path.empty())
+    return false;
+
+  const std::filesystem::path normalized =
+      std::filesystem::path(raw_path).lexically_normal();
+  if (normalized.empty() || normalized == "." || normalized.has_root_name() ||
+      normalized.has_root_directory() || normalized.is_absolute() ||
+      normalized.filename().empty()) {
+    return false;
+  }
+
+  for (const auto &part : normalized) {
+    const std::string piece = part.generic_string();
+    if (piece.empty() || piece == "." || piece == "..")
+      return false;
+  }
+
+  return true;
+}
+
+} // namespace
+
 /// @brief Builds LZ4 frame preferences at the given compression level.
 /// @param level LZ4 compression level (1-12). Levels >= 4 activate LZ4HC.
 static LZ4F_preferences_t make_lz4_prefs(int level) {
@@ -185,7 +218,7 @@ ArchiveWriter::pack_directory(const std::filesystem::path &input_dir,
                               const std::filesystem::path &output_file,
                               int compression_level, ProgressCallback progress,
                               const EncryptionOptions &encryption,
-                              bool enable_journal) {
+                              bool enable_journal) try {
   if (!std::filesystem::exists(input_dir) ||
       !std::filesystem::is_directory(input_dir))
     return vfs::unexpected<ErrorCode>(ErrorCode::FileNotFound);
@@ -395,6 +428,10 @@ ArchiveWriter::pack_directory(const std::filesystem::path &input_dir,
   std::filesystem::remove(journal_file);
 
   return Result<void>{};
+} catch (const std::filesystem::filesystem_error &e) {
+  return vfs::unexpected<ErrorCode>(map_io_error(e.code()));
+} catch (const std::system_error &e) {
+  return vfs::unexpected<ErrorCode>(map_io_error(e.code()));
 }
 
 // ---------------------------------------------------------------------------
@@ -404,7 +441,7 @@ ArchiveWriter::pack_directory(const std::filesystem::path &input_dir,
 Result<void> ArchiveWriter::append_file(
     const std::filesystem::path &source_file, const std::string &virtual_path,
     const std::filesystem::path &archive_file, int compression_level,
-    const EncryptionOptions &encryption) {
+    const EncryptionOptions &encryption) try {
 
   if (!std::filesystem::exists(source_file) ||
       !std::filesystem::is_regular_file(source_file)) {
@@ -413,6 +450,8 @@ Result<void> ArchiveWriter::append_file(
 
   std::string normalized_path = virtual_path;
   std::replace(normalized_path.begin(), normalized_path.end(), '\\', '/');
+  if (!is_safe_archive_entry_path(normalized_path))
+    return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);
 
   std::fstream arc(archive_file,
                    std::ios::binary | std::ios::in | std::ios::out);
@@ -428,6 +467,8 @@ Result<void> ArchiveWriter::append_file(
     return vfs::unexpected<ErrorCode>(
         ErrorCode::InvalidMagic); // Only support AVV4 single-file
   }
+  if (from_disk32(header.version) != 4)
+    return vfs::unexpected<ErrorCode>(ErrorCode::UnsupportedVersion);
 
   // Move to the footer position to read the current central directory offset
   arc.seekg(-static_cast<std::streamoff>(sizeof(ArchiveFooter)), std::ios::end);
@@ -441,6 +482,9 @@ Result<void> ArchiveWriter::append_file(
   }
 
   const uint64_t dir_offset = from_disk64(footer.directory_offset);
+  if (dir_offset < sizeof(ArchiveHeader) ||
+      dir_offset > static_cast<uint64_t>(footer_pos))
+    return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);
   const uint64_t directory_size =
       static_cast<uint64_t>(footer_pos) - dir_offset;
 
@@ -451,18 +495,23 @@ Result<void> ArchiveWriter::append_file(
   while (bytes_read < directory_size) {
     CentralDirectoryEntryBase base;
     if (!arc.read(reinterpret_cast<char *>(&base), sizeof(base)))
-      break;
+      return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);
     bytes_read += sizeof(base);
 
     uint16_t path_len = from_disk16(base.path_length);
+    const uint16_t flags = from_disk16(base.flags);
+    if (path_len == 0 || bytes_read + path_len > directory_size)
+      return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);
     std::string path(path_len, '\0');
     if (!arc.read(&path[0], path_len))
-      break;
+      return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);
     bytes_read += path_len;
+    if (!cde_flags_valid(flags) || !is_safe_archive_entry_path(path))
+      return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);
 
     TempEntry e;
     e.path = std::move(path);
-    e.flags = from_disk16(base.flags);
+    e.flags = flags;
     e.chunk_index = 0;
     e.size_offset = from_disk64(base.size_offset);
     e.size = from_disk64(base.size);
@@ -594,6 +643,10 @@ Result<void> ArchiveWriter::append_file(
   }
 
   return Result<void>{};
+} catch (const std::filesystem::filesystem_error &e) {
+  return vfs::unexpected<ErrorCode>(map_io_error(e.code()));
+} catch (const std::system_error &e) {
+  return vfs::unexpected<ErrorCode>(map_io_error(e.code()));
 }
 
 // ---------------------------------------------------------------------------
@@ -604,7 +657,7 @@ Result<void> ArchiveWriter::pack_directory_split(
     const std::filesystem::path &input_dir,
     const std::filesystem::path &output_stem, uint64_t max_chunk_bytes,
     int compression_level, ProgressCallback progress,
-    const EncryptionOptions &encryption, bool enable_journal) {
+    const EncryptionOptions &encryption, bool enable_journal) try {
 
   if (!std::filesystem::exists(input_dir) ||
       !std::filesystem::is_directory(input_dir))
@@ -730,6 +783,8 @@ Result<void> ArchiveWriter::pack_directory_split(
     if (cur_chunk_used > 0 &&
         cur_chunk_used + payload.stored_size + iv.size() > max_chunk_bytes) {
       cur_chunk.close();
+      if (cur_chunk_idx == 0xFFFFu)
+        return vfs::unexpected<ErrorCode>(ErrorCode::ArchiveTooLarge);
       ++cur_chunk_idx;
       cur_chunk_used = 0;
       cur_chunk.open(chunk_path(cur_chunk_idx),
@@ -816,10 +871,9 @@ Result<void> ArchiveWriter::pack_directory_split(
   std::memcpy(footer.magic_end, "5VVA_EOF", 8);
   footer.directory_offset = to_disk64(dir_offset);
   dir_out.write(reinterpret_cast<const char *>(&footer), sizeof(footer));
-  // Compute final hash from the newly written directory file
-  // (Notice: we do not use running_hash, as the reader expects a fresh hash for
-  // AVV5 _dir.avv)
-  Fnv1a64 hasher;
+  // The split-archive hash covers every chunk payload in chunk order followed
+  // by the directory file contents after the header.
+  Fnv1a64 hasher(running_hash);
   dir_out.seekg(24, std::ios::beg);
   char buf[8192];
   while (dir_out.read(buf, sizeof(buf))) {
@@ -841,6 +895,10 @@ Result<void> ArchiveWriter::pack_directory_split(
   std::filesystem::remove(journal_file);
 
   return Result<void>{};
+} catch (const std::filesystem::filesystem_error &e) {
+  return vfs::unexpected<ErrorCode>(map_io_error(e.code()));
+} catch (const std::system_error &e) {
+  return vfs::unexpected<ErrorCode>(map_io_error(e.code()));
 }
 
 // ---------------------------------------------------------------------------
@@ -849,10 +907,12 @@ Result<void> ArchiveWriter::pack_directory_split(
 
 Result<void>
 ArchiveWriter::delete_file(const std::string &virtual_path,
-                           const std::filesystem::path &archive_file) {
+                           const std::filesystem::path &archive_file) try {
 
   std::string normalized_path = virtual_path;
   std::replace(normalized_path.begin(), normalized_path.end(), '\\', '/');
+  if (!is_safe_archive_entry_path(normalized_path))
+    return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);
 
   std::fstream arc(archive_file,
                    std::ios::binary | std::ios::in | std::ios::out);
@@ -868,6 +928,8 @@ ArchiveWriter::delete_file(const std::string &virtual_path,
     return vfs::unexpected<ErrorCode>(
         ErrorCode::InvalidMagic); // Only support AVV4 single-file
   }
+  if (from_disk32(header.version) != 4)
+    return vfs::unexpected<ErrorCode>(ErrorCode::UnsupportedVersion);
 
   // Move to the footer position to read the current central directory offset
   arc.seekg(-static_cast<std::streamoff>(sizeof(ArchiveFooter)), std::ios::end);
@@ -881,6 +943,9 @@ ArchiveWriter::delete_file(const std::string &virtual_path,
   }
 
   const uint64_t dir_offset = from_disk64(footer.directory_offset);
+  if (dir_offset < sizeof(ArchiveHeader) ||
+      dir_offset > static_cast<uint64_t>(footer_pos))
+    return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);
   const uint64_t directory_size =
       static_cast<uint64_t>(footer_pos) - dir_offset;
 
@@ -891,14 +956,19 @@ ArchiveWriter::delete_file(const std::string &virtual_path,
   while (bytes_read < directory_size) {
     CentralDirectoryEntryBase base;
     if (!arc.read(reinterpret_cast<char *>(&base), sizeof(base)))
-      break;
+      return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);
     bytes_read += sizeof(base);
 
     uint16_t path_len = from_disk16(base.path_length);
+    const uint16_t flags = from_disk16(base.flags);
+    if (path_len == 0 || bytes_read + path_len > directory_size)
+      return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);
     std::string path(path_len, '\0');
     if (!arc.read(&path[0], path_len))
-      break;
+      return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);
     bytes_read += path_len;
+    if (!cde_flags_valid(flags) || !is_safe_archive_entry_path(path))
+      return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);
 
     if (path == normalized_path) {
       found = true;
@@ -907,7 +977,7 @@ ArchiveWriter::delete_file(const std::string &virtual_path,
 
     TempEntry e;
     e.path = std::move(path);
-    e.flags = from_disk16(base.flags);
+    e.flags = flags;
     e.chunk_index = 0;
     e.size_offset = from_disk64(base.size_offset);
     e.size = from_disk64(base.size);
@@ -946,11 +1016,14 @@ ArchiveWriter::delete_file(const std::string &virtual_path,
   arc.seekg(24, std::ios::beg); // Skip 24-byte header
   Fnv1a64 hasher;
   char buf[8192];
-  while (arc.read(buf, sizeof(buf))) {
+  uint64_t hashed = 0;
+  uint64_t to_hash = final_file_size - 24;
+  while (hashed < to_hash) {
+    uint64_t to_read =
+        std::min(static_cast<uint64_t>(sizeof(buf)), to_hash - hashed);
+    arc.read(buf, static_cast<std::streamsize>(to_read));
     hasher.update(buf, static_cast<size_t>(arc.gcount()));
-  }
-  if (arc.gcount() > 0) {
-    hasher.update(buf, static_cast<size_t>(arc.gcount()));
+    hashed += arc.gcount();
   }
   const uint64_t final_hash = hasher.digest();
 
@@ -967,6 +1040,10 @@ ArchiveWriter::delete_file(const std::string &virtual_path,
   }
 
   return Result<void>{};
+} catch (const std::filesystem::filesystem_error &e) {
+  return vfs::unexpected<ErrorCode>(map_io_error(e.code()));
+} catch (const std::system_error &e) {
+  return vfs::unexpected<ErrorCode>(map_io_error(e.code()));
 }
 
 } // namespace vfs

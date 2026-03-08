@@ -71,8 +71,8 @@ struct DirectoryNode {
  * @brief Central application state shared across all VFB UI panels.
  */
 struct AppState {
-  std::unique_ptr<vfs::ArchiveReader> reader =
-      std::make_unique<vfs::ArchiveReader>();
+  std::shared_ptr<vfs::ArchiveReader> reader =
+      std::make_shared<vfs::ArchiveReader>();
 
   bool archive_open = false;
   bool archive_encrypted = false;
@@ -87,6 +87,8 @@ struct AppState {
   char global_password[128] = {};
   char status_msg[512] = "No archive open.";
   bool open_dialog_requested = false;
+  bool refresh_requested =
+      false; // Flag to defer archive re-opening out of ImGui loop
 
   GLuint preview_texture = 0;
   int preview_width = 0;
@@ -102,16 +104,26 @@ struct AppState {
   std::string extract_current_file; // protected by extract_mutex
   std::mutex extract_mutex;
   std::thread extract_thread;
-  bool extract_succeeded = false;
+  std::atomic<bool> extract_succeeded{false};
 
   /// @brief Attempt to open an archive. Updates status_msg on failure.
   void open(const std::string &path) {
-    reader = std::make_unique<vfs::ArchiveReader>(); // fresh instance
+    reader = std::make_shared<vfs::ArchiveReader>(); // fresh instance
     archive_open = false;
+    archive_encrypted = false;
+    refresh_requested = false;
     password_verified = false;
+    archive_path_str.clear();
     std::memset(prev_password, 0, sizeof(prev_password));
     selected_entry.reset();
     preview_data.clear();
+    drag_out_pending.clear();
+    root_dir.reset();
+    current_dir = nullptr;
+    if (preview_texture) {
+      glDeleteTextures(1, &preview_texture);
+      preview_texture = 0;
+    }
 
     auto result = reader->open(std::filesystem::path(path));
     if (result) {
@@ -238,22 +250,23 @@ struct AppState {
       return;
     if (extract_thread.joinable())
       extract_thread.join();
+    auto reader_ref = reader;
 
     extract_current.store(0);
-    extract_total.store(static_cast<uint32_t>(reader->get_entries().size()));
+    extract_total.store(static_cast<uint32_t>(reader_ref->get_entries().size()));
     extracting.store(true);
-    extract_succeeded = false;
+    extract_succeeded.store(false);
 
     std::string pass = global_password;
-    extract_thread = std::thread([this, out_dir, pass]() {
+    extract_thread = std::thread([this, reader_ref, out_dir, pass]() {
       auto cb = [this](uint32_t cur, uint32_t tot, const std::string &path) {
         extract_current.store(cur);
         extract_total.store(tot);
         std::lock_guard<std::mutex> lk(extract_mutex);
         extract_current_file = path;
       };
-      auto r = reader->unpack_all(out_dir, cb, pass);
-      extract_succeeded = r.has_value();
+      auto r = reader_ref->unpack_all(out_dir, cb, pass);
+      extract_succeeded.store(r.has_value());
       extracting.store(false);
     });
   }
@@ -282,10 +295,18 @@ static bool render_menu_bar(AppState &state, bool &show_hex) {
         state.start_extract_all(out);
       }
       if (state.archive_open && ImGui::MenuItem("Close Archive")) {
-        state.reader = std::make_unique<vfs::ArchiveReader>();
+        state.reader = std::make_shared<vfs::ArchiveReader>();
         state.archive_open = false;
+        state.archive_encrypted = false;
+        state.password_verified = false;
+        state.archive_path_str.clear();
         state.selected_entry.reset();
         state.preview_data.clear();
+        state.drag_out_pending.clear();
+        if (state.preview_texture) {
+          glDeleteTextures(1, &state.preview_texture);
+          state.preview_texture = 0;
+        }
         state.root_dir.reset();
         state.current_dir = nullptr;
         std::snprintf(state.status_msg, sizeof(state.status_msg),
@@ -505,30 +526,60 @@ static void render_explorer(AppState &state) {
           if (ImGui::MenuItem("Copy Path"))
             ImGui::SetClipboardText(ep->path.c_str());
           if (ImGui::MenuItem("Delete File")) {
-            vfs::ArchiveWriter writer;
-            auto res = writer.delete_file(ep->path, state.archive_path_str);
-            if (res) {
+            if (state.extracting.load()) {
               std::snprintf(state.status_msg, sizeof(state.status_msg),
-                            "Deleted: %s", ep->path.c_str());
-              state.open(state.archive_path_str);
+                            "Cannot delete: extraction in progress.");
             } else {
-              std::snprintf(state.status_msg, sizeof(state.status_msg),
-                            "Delete failed (error %d)",
-                            static_cast<int>(res.error()));
+              vfs::ArchiveWriter writer;
+              std::string path_to_del = ep->path;
+              std::string arc_path = state.archive_path_str;
+              state.reader->close(); // unlock file handle
+              auto res = writer.delete_file(path_to_del, arc_path);
+              if (res) {
+                std::snprintf(state.status_msg, sizeof(state.status_msg),
+                              "Deleted: %s", path_to_del.c_str());
+              } else {
+                std::snprintf(state.status_msg, sizeof(state.status_msg),
+                              "Delete failed (error %d)",
+                              static_cast<int>(res.error()));
+              }
+              state.refresh_requested = true;
             }
           }
           if (ImGui::MenuItem("Extract to CWD")) {
-            auto res = state.reader->extract_file(
-                ep->path,
+            if (state.extracting.load()) {
+              std::snprintf(state.status_msg, sizeof(state.status_msg),
+                            "Extraction already in progress.");
+              ImGui::EndPopup();
+              continue;
+            }
+            std::string path_to_extract = ep->path;
+            std::filesystem::path full_out_path =
                 std::filesystem::current_path() /
-                    std::filesystem::path(ep->path).filename(),
+                std::filesystem::path(ep->path).filename();
+
+            state.extracting.store(true);
+            state.extract_current.store(0);
+            state.extract_total.store(1);
+            state.extract_succeeded.store(false);
+            {
+              std::lock_guard<std::mutex> lk(state.extract_mutex);
+              state.extract_current_file = path_to_extract;
+            }
+
+            state.reader->extract_file_async(
+                path_to_extract, full_out_path,
+                [&state, path_to_extract](vfs::Result<void> res) {
+                  state.extract_succeeded.store(res.has_value());
+                  state.extracting.store(false);
+                  if (res)
+                    std::snprintf(state.status_msg, sizeof(state.status_msg),
+                                  "Extracted: %s", path_to_extract.c_str());
+                  else
+                    std::snprintf(state.status_msg, sizeof(state.status_msg),
+                                  "Extract failed");
+                },
                 state.global_password);
-            if (res)
-              std::snprintf(state.status_msg, sizeof(state.status_msg),
-                            "Extracted: %s", ep->path.c_str());
-            else
-              std::snprintf(state.status_msg, sizeof(state.status_msg),
-                            "Extract failed");
           }
           ImGui::EndPopup();
         }
@@ -537,7 +588,7 @@ static void render_explorer(AppState &state) {
         ImGui::TableSetColumnIndex(2);
         ImGui::TextUnformatted(format_size(ep->compressed_size).c_str());
         ImGui::TableSetColumnIndex(3);
-        if (ep->flags & 0x01)
+        if (vfs::cde_is_lz4(ep->flags))
           ImGui::TextColored({0.4f, 0.9f, 0.5f, 1.f}, "LZ4");
         else
           ImGui::TextDisabled("Raw");
@@ -606,28 +657,59 @@ static void render_explorer(AppState &state) {
           if (ImGui::MenuItem("Copy Path"))
             ImGui::SetClipboardText(ep->path.c_str());
           if (ImGui::MenuItem("Delete File")) {
-            vfs::ArchiveWriter writer;
-            auto res = writer.delete_file(ep->path, state.archive_path_str);
-            if (res) {
+            if (state.extracting.load()) {
               std::snprintf(state.status_msg, sizeof(state.status_msg),
-                            "Deleted: %s", ep->path.c_str());
-              state.open(state.archive_path_str);
+                            "Cannot delete: extraction in progress.");
             } else {
-              std::snprintf(state.status_msg, sizeof(state.status_msg),
-                            "Delete failed (error %d)",
-                            static_cast<int>(res.error()));
+              vfs::ArchiveWriter writer;
+              std::string path_to_del = ep->path;
+              std::string arc_path = state.archive_path_str;
+              state.reader->close(); // unlock file handle
+              auto res = writer.delete_file(path_to_del, arc_path);
+              if (res) {
+                std::snprintf(state.status_msg, sizeof(state.status_msg),
+                              "Deleted: %s", path_to_del.c_str());
+              } else {
+                std::snprintf(state.status_msg, sizeof(state.status_msg),
+                              "Delete failed (error %d)",
+                              static_cast<int>(res.error()));
+              }
+              state.refresh_requested = true;
             }
           }
           if (ImGui::MenuItem("Extract to CWD")) {
-            auto res = state.reader->extract_file(
-                ep->path, std::filesystem::current_path() / filename,
+            if (state.extracting.load()) {
+              std::snprintf(state.status_msg, sizeof(state.status_msg),
+                            "Extraction already in progress.");
+              ImGui::EndPopup();
+              continue;
+            }
+            std::string path_to_extract = ep->path;
+            std::filesystem::path full_out_path =
+                std::filesystem::current_path() / filename;
+
+            state.extracting.store(true);
+            state.extract_current.store(0);
+            state.extract_total.store(1);
+            state.extract_succeeded.store(false);
+            {
+              std::lock_guard<std::mutex> lk(state.extract_mutex);
+              state.extract_current_file = path_to_extract;
+            }
+
+            state.reader->extract_file_async(
+                path_to_extract, full_out_path,
+                [&state, path_to_extract, filename](vfs::Result<void> res) {
+                  state.extract_succeeded.store(res.has_value());
+                  state.extracting.store(false);
+                  if (res)
+                    std::snprintf(state.status_msg, sizeof(state.status_msg),
+                                  "Extracted: %s", filename.c_str());
+                  else
+                    std::snprintf(state.status_msg, sizeof(state.status_msg),
+                                  "Extract failed");
+                },
                 state.global_password);
-            if (res)
-              std::snprintf(state.status_msg, sizeof(state.status_msg),
-                            "Extracted: %s", filename.c_str());
-            else
-              std::snprintf(state.status_msg, sizeof(state.status_msg),
-                            "Extract failed");
           }
           ImGui::EndPopup();
         }
@@ -636,7 +718,7 @@ static void render_explorer(AppState &state) {
         ImGui::TableSetColumnIndex(2);
         ImGui::TextUnformatted(format_size(ep->compressed_size).c_str());
         ImGui::TableSetColumnIndex(3);
-        if (ep->flags & 0x01)
+        if (vfs::cde_is_lz4(ep->flags))
           ImGui::TextColored({0.4f, 0.9f, 0.5f, 1.f}, "LZ4");
         else
           ImGui::TextDisabled("Raw");
@@ -664,7 +746,8 @@ static void render_details(AppState &state, bool show_hex) {
   ImGui::Text("On Disk:        %s", format_size(e.compressed_size).c_str());
   ImGui::Text("Archive Offset: 0x%llX",
               static_cast<unsigned long long>(e.size_offset));
-  ImGui::Text("Compression:    %s", (e.flags & 0x01) ? "LZ4 Frame" : "None");
+  ImGui::Text("Compression:    %s",
+              vfs::cde_is_lz4(e.flags) ? "LZ4 Frame" : "None");
   ImGui::Separator();
 
   if (ImGui::BeginTabBar("##preview_tabs")) {
@@ -850,19 +933,38 @@ int main(int argc, char **argv) {
             std::filesystem::is_regular_file(dropped_path)) {
           vfs::ArchiveWriter writer;
           vfs::EncryptionOptions enc;
-          if (state.global_password[0] != '\0') {
-            enc.algorithm =
-                vfs::EncryptionAlgorithm::Aes256Ctr; // Default if none found
-            for (const auto &e : state.reader->get_entries()) {
-              if (e.flags & 0x04) {
-                enc.algorithm = vfs::EncryptionAlgorithm::Xor;
-                break;
-              }
-              if (e.flags & 0x08) {
-                enc.algorithm = vfs::EncryptionAlgorithm::Aes256Ctr;
-                break;
-              }
+          vfs::EncryptionAlgorithm archive_cipher =
+              vfs::EncryptionAlgorithm::None;
+          bool mixed_cipher = false;
+          for (const auto &e : state.reader->get_entries()) {
+            const auto cipher = static_cast<vfs::EncryptionAlgorithm>(
+                vfs::cde_cipher_id(e.flags));
+            if (cipher == vfs::EncryptionAlgorithm::None)
+              continue;
+            if (archive_cipher != vfs::EncryptionAlgorithm::None &&
+                archive_cipher != cipher) {
+              mixed_cipher = true;
+              break;
             }
+            archive_cipher = cipher;
+          }
+
+          if (mixed_cipher) {
+            std::snprintf(
+                state.status_msg, sizeof(state.status_msg),
+                "Cannot append: archive contains mixed encryption modes.");
+            SDL_free(event.drop.file);
+            continue;
+          }
+
+          if (archive_cipher != vfs::EncryptionAlgorithm::None) {
+            if (!state.password_verified || state.global_password[0] == '\0') {
+              std::snprintf(state.status_msg, sizeof(state.status_msg),
+                            "Cannot append: verify the archive password first.");
+              SDL_free(event.drop.file);
+              continue;
+            }
+            enc.algorithm = archive_cipher;
             enc.key = state.global_password;
           }
           std::string virtual_path = dropped_path.filename().string();
@@ -880,17 +982,21 @@ int main(int argc, char **argv) {
             virtual_path += dropped_path.filename().string();
           }
 
-          auto res = writer.append_file(
-              dropped_path, virtual_path, state.archive_path_str,
-              state.reader->get_default_compression_level(), enc);
+          std::string arc_path = state.archive_path_str;
+          uint8_t cmp_level = state.reader->get_default_compression_level();
+          state.reader->close(); // release async read handles before writing!
+
+          auto res = writer.append_file(dropped_path, virtual_path, arc_path,
+                                        cmp_level, enc);
           if (res) {
             std::snprintf(state.status_msg, sizeof(state.status_msg),
                           "Appended: %s", virtual_path.c_str());
-            state.open(state.archive_path_str); // Refresh the view
+            state.open(arc_path); // Refresh the view
           } else {
             std::snprintf(state.status_msg, sizeof(state.status_msg),
                           "Failed to append (error %d)",
                           static_cast<int>(res.error()));
+            state.open(arc_path); // Re-open anyway to restore access
           }
         } else {
           state.open(event.drop.file);
@@ -901,6 +1007,10 @@ int main(int argc, char **argv) {
 
     // Ctrl+O shortcut opens the file dialog popup
     // (must be called after NewFrame so ImGui can process it)
+
+    if (state.archive_open) {
+      state.reader->pump_callbacks();
+    }
 
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplSDL2_NewFrame();
@@ -956,7 +1066,7 @@ int main(int argc, char **argv) {
 
         if (!state.extracting.load()) {
           // Finished
-          if (state.extract_succeeded)
+          if (state.extract_succeeded.load())
             std::snprintf(state.status_msg, sizeof(state.status_msg),
                           "Extraction complete (%u files)", tot);
           else
@@ -984,30 +1094,50 @@ int main(int argc, char **argv) {
     ImGui::PopStyleVar();
 
     // Trigger Native Win32 Drag-and-Drop if requested
-    if (!state.drag_out_pending.empty()) {
+    if (!state.drag_out_pending.empty() && !state.extracting.load()) {
       std::string path_to_extract = state.drag_out_pending;
       state.drag_out_pending.clear();
 
       auto temp_dir = std::filesystem::temp_directory_path();
       auto full_out_path =
           temp_dir / std::filesystem::path(path_to_extract).filename();
-      auto res = state.reader->extract_file(path_to_extract, full_out_path,
-                                            state.global_password);
-      if (res) {
-#ifdef _WIN32
-        std::wstring wpath = full_out_path.wstring();
-        Win32DoDragDrop(wpath);
-        // clear the mouse state to avoid imgui sticking to dragging after the
-        // blocking DoDragDrop finishes
-        ImGui::GetIO().ClearInputMouse();
-#endif
-        std::snprintf(state.status_msg, sizeof(state.status_msg),
-                      "Extracted (Drag & Drop): %s", path_to_extract.c_str());
-      } else {
-        std::snprintf(state.status_msg, sizeof(state.status_msg),
-                      "Drag & Drop failed (error %d)",
-                      static_cast<int>(res.error()));
+
+      state.extracting.store(true);
+      state.extract_current.store(0);
+      state.extract_total.store(1);
+      state.extract_succeeded.store(false);
+      {
+        std::lock_guard<std::mutex> lk(state.extract_mutex);
+        state.extract_current_file = path_to_extract;
       }
+
+      state.reader->extract_file_async(
+          path_to_extract, full_out_path,
+          [&state, path_to_extract, full_out_path](vfs::Result<void> res) {
+            state.extract_succeeded.store(res.has_value());
+            state.extracting.store(false);
+            if (res) {
+#ifdef _WIN32
+              std::wstring wpath = full_out_path.wstring();
+              Win32DoDragDrop(wpath);
+              ImGui::GetIO().ClearInputMouse();
+#endif
+              std::snprintf(state.status_msg, sizeof(state.status_msg),
+                            "Extracted (Drag & Drop): %s",
+                            path_to_extract.c_str());
+            } else {
+              std::snprintf(state.status_msg, sizeof(state.status_msg),
+                            "Drag & Drop failed (error %d)",
+                            static_cast<int>(res.error()));
+            }
+          },
+          state.global_password);
+    }
+
+    // Process deferred archive refresh outside of any ImGui widget tree loops
+    if (state.refresh_requested && state.archive_open) {
+      state.refresh_requested = false;
+      state.open(state.archive_path_str);
     }
 
     // Render

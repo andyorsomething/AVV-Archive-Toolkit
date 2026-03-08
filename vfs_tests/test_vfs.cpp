@@ -152,10 +152,10 @@ TEST_CASE("LZ4HC Compression Flag and Roundtrip", "[vfs_core]") {
 
   for (const auto &e : entries) {
     if (e.path == "compressible.txt") {
-      CHECK((e.flags & 0x01) != 0);      // must be LZ4
+      CHECK(vfs::cde_is_lz4(e.flags));   // must be LZ4
       CHECK(e.compressed_size < e.size); // must actually shrink
     } else {
-      CHECK((e.flags & 0x01) == 0); // raw fallback
+      CHECK_FALSE(vfs::cde_is_lz4(e.flags)); // raw fallback
       CHECK(e.compressed_size == e.size);
     }
   }
@@ -163,6 +163,8 @@ TEST_CASE("LZ4HC Compression Flag and Roundtrip", "[vfs_core]") {
   REQUIRE(reader.unpack_all(out_dir).has_value());
   CHECK(read_file(out_dir / "compressible.txt") == compressible);
   CHECK(read_file(out_dir / "incompressible.bin") == incompressible);
+
+  reader.close();
 
   std::filesystem::remove_all(test_dir);
   std::filesystem::remove_all(out_dir);
@@ -211,6 +213,8 @@ TEST_CASE("AVV5 Split Pack Roundtrip - Single Chunk", "[vfs_core][split]") {
   REQUIRE(reader.unpack_all(out_dir).has_value());
   CHECK(read_file(out_dir / "alpha.txt") == "Alpha payload");
   CHECK(read_file(out_dir / "subdir" / "beta.bin") == "Beta payload");
+
+  reader.close();
 
   std::filesystem::remove_all(test_dir);
   std::filesystem::remove_all(out_dir);
@@ -281,6 +285,8 @@ TEST_CASE("AVV5 Split Pack Roundtrip - Multi Chunk", "[vfs_core][split]") {
   CHECK(got_b == payload_b);
   CHECK(got_c == payload_c);
 
+  reader.close();
+
   std::filesystem::remove_all(test_dir);
   std::filesystem::remove_all(out_dir);
   std::filesystem::remove(dir_avv);
@@ -341,6 +347,8 @@ TEST_CASE("AVV5 Split Single-File API", "[vfs_core][split]") {
 
     std::filesystem::remove(out_path);
   }
+
+  reader.close();
 
   std::filesystem::remove_all(test_dir);
   std::filesystem::remove(dir_avv);
@@ -498,6 +506,8 @@ TEST_CASE("AVV4 Single-File Extraction APIs", "[vfs_core]") {
     std::filesystem::remove(out_path);
   }
 
+  reader.close();
+
   std::filesystem::remove_all(test_dir);
   std::filesystem::remove(archive);
 }
@@ -532,6 +542,8 @@ TEST_CASE("XOR Encryption Roundtrip", "[vfs_core][crypto]") {
   REQUIRE(reader.open(archive).has_value());
   REQUIRE(reader.unpack_all(out_dir, nullptr, "my_password").has_value());
   CHECK(read_file(out_dir / "secret.txt") == "Top secret XOR payload.");
+
+  reader.close();
 
   std::filesystem::remove_all(test_dir);
   std::filesystem::remove_all(out_dir);
@@ -576,6 +588,8 @@ TEST_CASE("AES-256-CTR Encryption Roundtrip", "[vfs_core][crypto]") {
   REQUIRE(reader.unpack_all(out_dir, nullptr, "strong_password").has_value());
   CHECK(read_file(out_dir / "secret.txt") == secret);
 
+  reader.close();
+
   std::filesystem::remove_all(test_dir);
   std::filesystem::remove_all(out_dir);
   std::filesystem::remove(archive);
@@ -611,6 +625,79 @@ TEST_CASE("Tamper Detection (FNV-1a)", "[vfs_core][crypto]") {
   CHECK(res.error() == ErrorCode::HashMismatch);
 
   std::filesystem::remove_all(test_dir);
+  std::filesystem::remove(archive);
+}
+
+TEST_CASE("Split Archive Tamper Detection", "[vfs_core][crypto][split]") {
+  const std::filesystem::path test_dir = "tamper_split_in";
+  const std::string stem = "tamper_split";
+  const std::filesystem::path dir_archive = stem + "_dir.avv";
+  const std::filesystem::path chunk_archive = stem + "_000.avv";
+
+  std::filesystem::remove_all(test_dir);
+  std::filesystem::remove(dir_archive);
+  std::filesystem::remove(chunk_archive);
+  std::filesystem::create_directories(test_dir);
+
+  write_file(test_dir / "data.txt", "Split archive data.");
+
+  ArchiveWriter writer;
+  REQUIRE(writer.pack_directory_split(test_dir, stem).has_value());
+
+  {
+    std::fstream f(chunk_archive, std::ios::binary | std::ios::in | std::ios::out);
+    REQUIRE(f.is_open());
+    f.seekg(0, std::ios::beg);
+    char c;
+    f.read(&c, 1);
+    c ^= 0xFF;
+    f.seekp(0, std::ios::beg);
+    f.write(&c, 1);
+  }
+
+  ArchiveReader reader;
+  auto res = reader.open(dir_archive);
+  REQUIRE_FALSE(res.has_value());
+  CHECK(res.error() == ErrorCode::HashMismatch);
+
+  std::filesystem::remove_all(test_dir);
+  std::filesystem::remove(dir_archive);
+  std::filesystem::remove(chunk_archive);
+}
+
+TEST_CASE("Unsafe Archive Paths Are Rejected", "[vfs_core][security]") {
+  const std::filesystem::path archive = "unsafe_path.avv";
+
+  std::filesystem::remove(archive);
+  {
+    std::ofstream out(archive, std::ios::binary);
+    REQUIRE(out.is_open());
+
+    ArchiveHeader header;
+    header.directory_hash = to_disk64(0);
+    out.write(reinterpret_cast<const char *>(&header), sizeof(header));
+
+    const uint64_t dir_offset = sizeof(ArchiveHeader);
+    CentralDirectoryEntryBase base{};
+    const std::string bad_path = "../escape.txt";
+    base.path_length = to_disk16(static_cast<uint16_t>(bad_path.size()));
+    base.flags = to_disk16(0);
+    base.size_offset = to_disk64(0);
+    base.size = to_disk64(0);
+    base.compressed_size = to_disk64(0);
+    out.write(reinterpret_cast<const char *>(&base), sizeof(base));
+    out.write(bad_path.data(), static_cast<std::streamsize>(bad_path.size()));
+
+    ArchiveFooter footer{};
+    footer.directory_offset = to_disk64(dir_offset);
+    out.write(reinterpret_cast<const char *>(&footer), sizeof(footer));
+  }
+
+  ArchiveReader reader;
+  auto res = reader.open(archive);
+  REQUIRE_FALSE(res.has_value());
+  CHECK(res.error() == ErrorCode::CorruptedArchive);
+
   std::filesystem::remove(archive);
 }
 
@@ -680,6 +767,8 @@ TEST_CASE("Journaling Resume Roundtrip", "[vfs_core][journal]") {
           "Content " + std::to_string(i));
   }
 
+  reader.close();
+
   std::filesystem::remove_all(test_dir);
   std::filesystem::remove_all(out_dir);
   std::filesystem::remove(archive);
@@ -720,6 +809,8 @@ TEST_CASE("AVV4 Append File Roundtrip", "[vfs_core][append]") {
 
   CHECK(read_file(out_dir / "file1.txt") == "Overwritten file content");
   CHECK(read_file(out_dir / "file2.txt") == "Appended file content");
+
+  reader.close();
 
   std::filesystem::remove_all(test_dir);
   std::filesystem::remove_all(out_dir);
@@ -796,8 +887,134 @@ TEST_CASE("AVV4 Append Encrypted File", "[vfs_core][append][crypto]") {
   CHECK(read_file(out_dir / "file1.txt") == "Initial file content");
   CHECK(read_file(out_dir / "file2.txt") == "Appended encrypted content");
 
+  reader.close();
+
   std::filesystem::remove_all(test_dir);
   std::filesystem::remove_all(out_dir);
   std::filesystem::remove(archive);
   std::filesystem::remove(new_file);
+}
+
+// ===========================================================================
+// ThreadPool and MemoryArena Tests
+// ===========================================================================
+
+#include "../vfs_core/thread_pool.h"
+
+TEST_CASE("ThreadPool and MemoryArena - Basic Enqueue and Results",
+          "[vfs_core][async]") {
+  vfs::ThreadPool pool(4);
+
+  auto f1 = pool.enqueue([]() { return 42; });
+  auto f2 = pool.enqueue([](int a, int b) { return a + b; }, 10, 20);
+
+  REQUIRE(f1.get() == 42);
+  REQUIRE(f2.get() == 30);
+}
+
+TEST_CASE("MemoryArena - Thread-local Allocations", "[vfs_core][async]") {
+  vfs::ThreadPool pool(2);
+
+  auto f1 = pool.enqueue([]() {
+    vfs::MemoryArena &arena = vfs::ThreadPool::get_local_arena();
+    void *ptr = arena.allocate(100);
+    REQUIRE(ptr != nullptr);
+
+    void *ptr2 = arena.allocate(200);
+    REQUIRE(ptr2 != nullptr);
+    REQUIRE(ptr != ptr2);
+
+    return true;
+  });
+
+  REQUIRE(f1.get() == true);
+}
+
+TEST_CASE("ThreadPool - Concurrent execution", "[vfs_core][async]") {
+  vfs::ThreadPool pool(8);
+  std::atomic<int> counter{0};
+  std::vector<std::future<void>> futures;
+
+  for (int i = 0; i < 100; ++i) {
+    futures.push_back(pool.enqueue([&counter]() {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      counter++;
+    }));
+  }
+
+  for (auto &f : futures) {
+    f.get();
+  }
+
+  REQUIRE(counter.load() == 100);
+}
+
+TEST_CASE("ThreadPool - Zero Worker Fallback", "[vfs_core][async]") {
+  vfs::ThreadPool pool(0);
+  auto f = pool.enqueue([]() { return 7; });
+  REQUIRE(f.get() == 7);
+}
+
+// ===========================================================================
+// Async I/O Tests
+// ===========================================================================
+
+TEST_CASE("Async I/O - Concurrent Reads", "[vfs_core][async]") {
+  const std::filesystem::path test_dir = "async_in";
+  const std::filesystem::path archive = "async_test.avv";
+
+  std::filesystem::remove_all(test_dir);
+  std::filesystem::remove(archive);
+  std::filesystem::create_directories(test_dir);
+
+  const int num_files = 50;
+  for (int i = 0; i < num_files; ++i) {
+    write_file(test_dir / ("file_" + std::to_string(i) + ".txt"),
+               "Content for async file " + std::to_string(i));
+  }
+
+  vfs::ArchiveWriter writer;
+  REQUIRE(writer.pack_directory(test_dir, archive).has_value());
+
+  vfs::ArchiveReader reader;
+  REQUIRE(reader.open(archive).has_value());
+
+  std::atomic<int> completed_reads{0};
+
+  // Queue up all async reads
+  for (int i = 0; i < num_files; ++i) {
+    std::string internal_path = "file_" + std::to_string(i) + ".txt";
+    std::string expected_content =
+        "Content for async file " + std::to_string(i);
+
+    reader.read_file_async(
+        internal_path, [&completed_reads,
+                        expected_content](vfs::Result<std::vector<char>> res) {
+          REQUIRE(res.has_value());
+          std::string got(res.value().begin(), res.value().end());
+          REQUIRE(got == expected_content);
+          completed_reads++;
+        });
+  }
+
+  // Pump callbacks until all are done (with a timeout to prevent infinite loops
+  // if broken)
+  auto start_time = std::chrono::steady_clock::now();
+  while (completed_reads < num_files) {
+    reader.pump_callbacks();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+    // 5 second flush timeout
+    if (std::chrono::steady_clock::now() - start_time >
+        std::chrono::seconds(5)) {
+      break;
+    }
+  }
+
+  REQUIRE(completed_reads.load() == num_files);
+
+  reader.close();
+
+  std::filesystem::remove_all(test_dir);
+  std::filesystem::remove(archive);
 }

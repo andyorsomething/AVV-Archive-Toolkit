@@ -70,6 +70,8 @@
   <ItemGroup>
     <ClCompile Include="test_vfs.cpp" />
     <ClCompile Include="..\vfs_core\archive_reader.cpp" />
+    <ClCompile Include="..\vfs_core\archive_reader_win32.cpp" />
+    <ClCompile Include="..\vfs_core\thread_pool.cpp" />
     <ClCompile Include="..\vfs_core\archive_writer.cpp" />
     <ClCompile Include="..\vfs_core\crypto_utils.cpp" />
     <ClCompile Include="..\third_party\lz4\lz4.c" />
@@ -80,6 +82,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\vfs_core\archive_reader.h" />
+    <ClInclude Include="..\vfs_core\thread_pool.h" />
     <ClInclude Include="..\vfs_core\archive_writer.h" />
     <ClInclude Include="..\vfs_core\crypto_utils.h" />
     <ClInclude Include="..\vfs_core\vfs_types.h" />

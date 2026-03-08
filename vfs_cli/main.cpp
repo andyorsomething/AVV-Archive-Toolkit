@@ -93,7 +93,7 @@ static void render_progress(uint32_t current, uint32_t total,
 /// compression.
 static void print_entries(const vfs::ArchiveReader &reader, const char *verb) {
   for (const auto &e : reader.get_entries()) {
-    const char *comp = (e.flags & 0x01) ? "LZ4" : "Raw";
+    const char *comp = vfs::cde_is_lz4(e.flags) ? "LZ4" : "Raw";
     std::printf("  %s: [%03u] %-36s %10s  [%s]\n", verb, e.chunk_index,
                 e.path.c_str(), format_size(e.size).c_str(), comp);
   }
@@ -215,9 +215,10 @@ int main(int argc, char **argv) {
                 << "_dir.avv  (chunks: " << chunk_gb << " GiB, level "
                 << comp_level << ")\n\n";
 
-      vfs::ArchiveWriter writer;
-      auto r = writer.pack_directory_split(
-          dropped, stem, chunk_bytes, comp_level, render_progress, {}, true);
+       vfs::ArchiveWriter writer;
+       auto r = writer.pack_directory_split(
+           dropped, stem, chunk_bytes, comp_level, render_progress, enc_opts,
+           enable_journal);
       if (!r) {
         std::cerr << "Error: " << vfs::error_code_to_string(r.error()) << "\n";
         rc = 1;
@@ -243,7 +244,7 @@ int main(int argc, char **argv) {
         std::cerr << "Error: " << vfs::error_code_to_string(r.error()) << "\n";
         rc = 1;
       } else {
-        r = reader.unpack_all(out_dir, render_progress);
+        r = reader.unpack_all(out_dir, render_progress, enc_opts.key);
         if (!r) {
           std::cerr << "Error: " << vfs::error_code_to_string(r.error())
                     << "\n";
@@ -284,7 +285,7 @@ int main(int argc, char **argv) {
                  "--------\n";
     uint64_t ts = 0, td = 0;
     for (const auto &e : entries) {
-      const char *c = (e.flags & 0x01) ? "LZ4" : "Raw";
+      const char *c = vfs::cde_is_lz4(e.flags) ? "LZ4" : "Raw";
       std::printf("  [%03u] %-40s %10s %10s  %s\n", e.chunk_index,
                   e.path.c_str(), format_size(e.size).c_str(),
                   format_size(e.compressed_size).c_str(), c);
