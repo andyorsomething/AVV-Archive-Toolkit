@@ -3,7 +3,7 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="virtualFileSystem_program/virtualFileSystem_program.vcxproj" Id="04b72cba-7c8f-4e1b-9bc3-df0bb1f2cf2d" />
+  <Project Path="vfs_cli/vfs_cli.vcxproj" Id="04b72cba-7c8f-4e1b-9bc3-df0bb1f2cf2d" />
   <Project Path="vfs_browser/vfs_browser.vcxproj" />
   <Project Path="vfs_tests/vfs_tests.vcxproj" Id="a1b2c3d4-e5f6-7890-abcd-ef1234567890" />
 </Solution>

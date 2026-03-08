@@ -22,7 +22,7 @@
     <VCProjectVersion>18.0</VCProjectVersion>
     <Keyword>Win32Proj</Keyword>
     <ProjectGuid>{04b72cba-7c8f-4e1b-9bc3-df0bb1f2cf2d}</ProjectGuid>
-    <RootNamespace>virtualFileSystemprogram</RootNamespace>
+    <RootNamespace>vfs_cli</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
     <ProjectName>vfs_cli</ProjectName>
   </PropertyGroup>
@@ -133,7 +133,7 @@
     <ClCompile Include="..\third_party\lz4\lz4hc.c" />
     <ClCompile Include="..\third_party\lz4\xxhash.c" />
     <ClCompile Include="..\third_party\tiny-aes-c\aes.c" />
-    <ClCompile Include="..\vfs_cli\main.cpp" />
+    <ClCompile Include="main.cpp" />
     <ClCompile Include="..\vfs_core\archive_reader.cpp" />
     <ClCompile Include="..\vfs_core\archive_reader_win32.cpp" />
     <ClCompile Include="..\vfs_core\thread_pool.cpp" />
