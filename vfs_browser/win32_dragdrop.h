@@ -7,9 +7,12 @@
 
 #ifdef _WIN32
 
+#include <functional>
+#include <iterator>
 #include <shlobj.h>
 #include <string>
 #include <windows.h>
+#include <commdlg.h>
 
 /**
  * @class DropSource
@@ -66,10 +69,13 @@ public:
 class DataObjectDrop : public IDataObject {
   LONG m_refCount = 1;
   std::wstring m_file;
+  std::function<bool()> m_materialize;
+  bool m_materialized = false;
 
 public:
   /// @brief Wraps a single filesystem path as a shell data object.
-  DataObjectDrop(const std::wstring &file) : m_file(file) {}
+  DataObjectDrop(const std::wstring &file, std::function<bool()> materialize)
+      : m_file(file), m_materialize(std::move(materialize)) {}
 
   /// @brief COM QueryInterface implementation for IDataObject.
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppv) override {
@@ -97,6 +103,11 @@ public:
                                     STGMEDIUM *pmedium) override {
     if (pformatetcIn->cfFormat == CF_HDROP &&
         (pformatetcIn->tymed & TYMED_HGLOBAL)) {
+      if (!m_materialized && m_materialize) {
+        if (!m_materialize())
+          return E_FAIL;
+        m_materialized = true;
+      }
       size_t len = m_file.length() +
                    2; // +1 for null, +1 for double-null termination of HDROP
       HGLOBAL hGlobal =
@@ -165,14 +176,20 @@ public:
 
 /**
  * @brief Synchronously triggers a Win32 OLE drag-and-drop operation for a file.
- * @param win_path Absolute wide-string path to the file on disk to be dragged.
+ * The materialize callback runs lazily only if the drop target actually
+ * requests file data.
+ * @param win_path Absolute wide-string path to the temporary file path that
+ * will be exposed to the shell.
+ * @param materialize Callback that creates the file on disk on demand.
+ * @return The shell drop effect, or zero if the drag was canceled/failed.
  */
-inline void Win32DoDragDrop(const std::wstring &win_path) {
+inline DWORD Win32DoDragDrop(const std::wstring &win_path,
+                             std::function<bool()> materialize) {
   HRESULT hrOle = OleInitialize(nullptr);
+  DWORD effect = 0;
   if (SUCCEEDED(hrOle) || hrOle == RPC_E_CHANGED_MODE) {
     DropSource *src = new DropSource();
-    DataObjectDrop *data = new DataObjectDrop(win_path);
-    DWORD effect = 0;
+    DataObjectDrop *data = new DataObjectDrop(win_path, std::move(materialize));
     DoDragDrop(data, src, DROPEFFECT_COPY, &effect);
     src->Release();
     data->Release();
@@ -180,6 +197,29 @@ inline void Win32DoDragDrop(const std::wstring &win_path) {
       OleUninitialize();
     }
   }
+  return effect;
+}
+
+/**
+ * @brief Opens a native Windows file picker restricted to `.avv` archives.
+ * @param owner Optional owner window handle.
+ * @return Absolute path to the selected archive, or an empty string if the
+ * dialog was canceled.
+ */
+inline std::wstring Win32OpenArchiveDialog(HWND owner = nullptr) {
+  wchar_t file_buf[MAX_PATH] = {};
+  OPENFILENAMEW ofn{};
+  ofn.lStructSize = sizeof(ofn);
+  ofn.hwndOwner = owner;
+  ofn.lpstrFile = file_buf;
+  ofn.nMaxFile = static_cast<DWORD>(std::size(file_buf));
+  ofn.lpstrFilter = L"AVV Archives (*.avv)\0*.avv\0All Files (*.*)\0*.*\0";
+  ofn.nFilterIndex = 1;
+  ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+  ofn.lpstrDefExt = L"avv";
+  if (!GetOpenFileNameW(&ofn))
+    return L"";
+  return std::wstring(file_buf);
 }
 
 #endif

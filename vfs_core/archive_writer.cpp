@@ -914,8 +914,7 @@ ArchiveWriter::delete_file(const std::string &virtual_path,
   if (!is_safe_archive_entry_path(normalized_path))
     return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);
 
-  std::fstream arc(archive_file,
-                   std::ios::binary | std::ios::in | std::ios::out);
+  std::ifstream arc(archive_file, std::ios::binary);
   if (!arc) {
     return vfs::unexpected<ErrorCode>(ErrorCode::IOError);
   }
@@ -989,10 +988,45 @@ ArchiveWriter::delete_file(const std::string &virtual_path,
     return vfs::unexpected<ErrorCode>(ErrorCode::FileNotFound);
   }
 
-  // Seek back to old directory offset to overwrite it with the shortened
-  // directory
-  arc.seekp(static_cast<std::streamoff>(dir_offset), std::ios::beg);
+  std::filesystem::path tmp_file = archive_file.string() + ".tmpdel";
+  std::fstream out(tmp_file,
+                   std::ios::binary | std::ios::in | std::ios::out |
+                       std::ios::trunc);
+  if (!out)
+    return vfs::unexpected<ErrorCode>(ErrorCode::IOError);
 
+  ArchiveHeader new_header = header;
+  new_header.directory_hash = to_disk64(0);
+  out.write(reinterpret_cast<const char *>(&new_header), sizeof(new_header));
+  if (!out.good())
+    return vfs::unexpected<ErrorCode>(ErrorCode::IOError);
+
+  Fnv1a64 hasher;
+  char buf[8192];
+  for (auto &e : entries) {
+    arc.clear();
+    arc.seekg(static_cast<std::streamoff>(e.size_offset), std::ios::beg);
+    if (!arc.good())
+      return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);
+
+    e.size_offset = static_cast<uint64_t>(out.tellp());
+    uint64_t remaining = e.compressed_size;
+    while (remaining > 0) {
+      const uint64_t to_read =
+          std::min<uint64_t>(remaining, static_cast<uint64_t>(sizeof(buf)));
+      arc.read(buf, static_cast<std::streamsize>(to_read));
+      const std::streamsize got = arc.gcount();
+      if (got <= 0 || static_cast<uint64_t>(got) != to_read)
+        return vfs::unexpected<ErrorCode>(ErrorCode::CorruptedArchive);
+      out.write(buf, got);
+      if (!out.good())
+        return vfs::unexpected<ErrorCode>(ErrorCode::IOError);
+      hasher.update(buf, static_cast<size_t>(got));
+      remaining -= static_cast<uint64_t>(got);
+    }
+  }
+
+  const uint64_t new_dir_offset = static_cast<uint64_t>(out.tellp());
   for (const auto &e : entries) {
     CentralDirectoryEntryBase base{};
     base.path_length = to_disk16(static_cast<uint16_t>(e.path.size()));
@@ -1000,44 +1034,42 @@ ArchiveWriter::delete_file(const std::string &virtual_path,
     base.size_offset = to_disk64(e.size_offset);
     base.size = to_disk64(e.size);
     base.compressed_size = to_disk64(e.compressed_size);
-    arc.write(reinterpret_cast<const char *>(&base), sizeof(base));
-    arc.write(e.path.c_str(), static_cast<std::streamsize>(e.path.size()));
+    out.write(reinterpret_cast<const char *>(&base), sizeof(base));
+    out.write(e.path.c_str(), static_cast<std::streamsize>(e.path.size()));
+    if (!out.good())
+      return vfs::unexpected<ErrorCode>(ErrorCode::IOError);
+    hasher.update(&base, sizeof(base));
+    hasher.update(e.path.data(), e.path.size());
   }
 
   ArchiveFooter new_footer{};
   std::memcpy(new_footer.magic_end, "4VVA_EOF", 8);
-  new_footer.directory_offset = to_disk64(dir_offset);
-  arc.write(reinterpret_cast<const char *>(&new_footer), sizeof(new_footer));
+  new_footer.directory_offset = to_disk64(new_dir_offset);
+  out.write(reinterpret_cast<const char *>(&new_footer), sizeof(new_footer));
+  if (!out.good())
+    return vfs::unexpected<ErrorCode>(ErrorCode::IOError);
+  hasher.update(&new_footer, sizeof(new_footer));
 
-  const uint64_t final_file_size = static_cast<uint64_t>(arc.tellp());
-
-  // Compute final hash
-  arc.clear();
-  arc.seekg(24, std::ios::beg); // Skip 24-byte header
-  Fnv1a64 hasher;
-  char buf[8192];
-  uint64_t hashed = 0;
-  uint64_t to_hash = final_file_size - 24;
-  while (hashed < to_hash) {
-    uint64_t to_read =
-        std::min(static_cast<uint64_t>(sizeof(buf)), to_hash - hashed);
-    arc.read(buf, static_cast<std::streamsize>(to_read));
-    hasher.update(buf, static_cast<size_t>(arc.gcount()));
-    hashed += arc.gcount();
-  }
-  const uint64_t final_hash = hasher.digest();
-
-  arc.clear();
-  arc.seekp(8, std::ios::beg); // Hash is at offset 8
-  const uint64_t disk_hash = to_disk64(final_hash);
-  arc.write(reinterpret_cast<const char *>(&disk_hash), sizeof(disk_hash));
+  const uint64_t disk_hash = to_disk64(hasher.digest());
+  out.seekp(8, std::ios::beg);
+  out.write(reinterpret_cast<const char *>(&disk_hash), sizeof(disk_hash));
+  out.close();
   arc.close();
 
   std::error_code ec;
-  std::filesystem::resize_file(archive_file, final_file_size, ec);
+  const std::filesystem::path backup_file = archive_file.string() + ".bakdel";
+  std::filesystem::remove(backup_file, ec);
+  ec.clear();
+  std::filesystem::rename(archive_file, backup_file, ec);
+  if (ec)
+    return vfs::unexpected<ErrorCode>(map_io_error(ec));
+  std::filesystem::rename(tmp_file, archive_file, ec);
   if (ec) {
-    return vfs::unexpected<ErrorCode>(ErrorCode::IOError);
+    std::error_code restore_ec;
+    std::filesystem::rename(backup_file, archive_file, restore_ec);
+    return vfs::unexpected<ErrorCode>(map_io_error(ec));
   }
+  std::filesystem::remove(backup_file, ec);
 
   return Result<void>{};
 } catch (const std::filesystem::filesystem_error &e) {

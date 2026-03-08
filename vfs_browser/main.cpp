@@ -10,6 +10,7 @@
 #include "win32_dragdrop.h"
 #include <SDL.h>
 #include <SDL_opengl.h>
+#include <SDL_syswm.h>
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -48,6 +49,98 @@ static std::string format_size(uint64_t bytes) {
   return buf;
 }
 
+static std::filesystem::path make_drag_temp_path(const std::string &internal_path) {
+  const auto stem = std::filesystem::path(internal_path).filename().string();
+  const auto nonce =
+      std::to_string(SDL_GetTicks64()) + "_" + std::to_string(::GetCurrentProcessId());
+  return std::filesystem::temp_directory_path() /
+         ("vfs_drag_" + nonce + "_" + stem);
+}
+
+#ifdef _WIN32
+static std::string narrow_from_wide(const std::wstring &value) {
+  if (value.empty())
+    return {};
+  const int size = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, nullptr,
+                                       0, nullptr, nullptr);
+  if (size <= 1)
+    return {};
+  std::string out(static_cast<size_t>(size), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, out.data(), size, nullptr,
+                      nullptr);
+  out.pop_back();
+  return out;
+}
+
+static HWND sdl_hwnd(SDL_Window *window) {
+  SDL_SysWMinfo wm_info;
+  SDL_VERSION(&wm_info.version);
+  if (!SDL_GetWindowWMInfo(window, &wm_info))
+    return nullptr;
+  return wm_info.info.win.window;
+}
+#endif
+
+struct AppState;
+
+static bool is_password_ready(const AppState &state);
+
+static bool entry_is_encrypted(const vfs::ArchiveReader::FileEntry &entry) {
+  return vfs::cde_cipher_id(entry.flags) != vfs::CipherAlgorithm::None;
+}
+
+static int compare_file_entries(const vfs::ArchiveReader::FileEntry *a,
+                                const vfs::ArchiveReader::FileEntry *b, int col,
+                                bool use_full_path) {
+  switch (col) {
+  case 0: {
+    const std::string a_name = use_full_path
+                                   ? a->path
+                                   : std::filesystem::path(a->path)
+                                         .filename()
+                                         .generic_string();
+    const std::string b_name = use_full_path
+                                   ? b->path
+                                   : std::filesystem::path(b->path)
+                                         .filename()
+                                         .generic_string();
+    return a_name.compare(b_name);
+  }
+  case 1:
+    return (a->size < b->size) ? -1 : (a->size > b->size ? 1 : 0);
+  case 2:
+    return (a->compressed_size < b->compressed_size)
+               ? -1
+               : (a->compressed_size > b->compressed_size ? 1 : 0);
+  case 3: {
+    const bool a_lz4 = vfs::cde_is_lz4(a->flags);
+    const bool b_lz4 = vfs::cde_is_lz4(b->flags);
+    return (a_lz4 == b_lz4) ? 0 : (a_lz4 ? 1 : -1);
+  }
+  default:
+    return a->path.compare(b->path);
+  }
+}
+
+static void sort_file_entries(
+    std::vector<const vfs::ArchiveReader::FileEntry *> &entries,
+    const ImGuiTableSortSpecs *specs, bool use_full_path) {
+  if (!specs || specs->SpecsCount == 0)
+    return;
+
+  const int col = specs->Specs[0].ColumnIndex;
+  const bool asc =
+      specs->Specs[0].SortDirection == ImGuiSortDirection_Ascending;
+  std::sort(entries.begin(), entries.end(),
+            [&](const vfs::ArchiveReader::FileEntry *a,
+                const vfs::ArchiveReader::FileEntry *b) {
+              const int cmp = compare_file_entries(a, b, col, use_full_path);
+              if (cmp == 0)
+                return a->path < b->path;
+              return asc ? (cmp < 0) : (cmp > 0);
+            });
+}
+
 // ============================================================
 // Application State
 // ============================================================
@@ -83,12 +176,15 @@ struct AppState {
   std::optional<vfs::ArchiveReader::FileEntry> selected_entry;
   std::vector<char> preview_data;
   std::string drag_out_pending;
+  std::filesystem::path drag_out_temp_path;
   char search_buf[256] = {};
   char global_password[128] = {};
   char status_msg[512] = "No archive open.";
   bool open_dialog_requested = false;
   bool refresh_requested =
       false; // Flag to defer archive re-opening out of ImGui loop
+  std::string refresh_path;
+  std::string refresh_status;
 
   GLuint preview_texture = 0;
   int preview_width = 0;
@@ -112,12 +208,15 @@ struct AppState {
     archive_open = false;
     archive_encrypted = false;
     refresh_requested = false;
+    refresh_path.clear();
+    refresh_status.clear();
     password_verified = false;
     archive_path_str.clear();
     std::memset(prev_password, 0, sizeof(prev_password));
     selected_entry.reset();
     preview_data.clear();
     drag_out_pending.clear();
+    drag_out_temp_path.clear();
     root_dir.reset();
     current_dir = nullptr;
     if (preview_texture) {
@@ -248,6 +347,11 @@ struct AppState {
   void start_extract_all(const std::filesystem::path &out_dir) {
     if (extracting.load())
       return;
+    if (archive_encrypted && !is_password_ready(*this)) {
+      std::snprintf(status_msg, sizeof(status_msg),
+                    "Cannot extract: verify the archive password first.");
+      return;
+    }
     if (extract_thread.joinable())
       extract_thread.join();
     auto reader_ref = reader;
@@ -276,8 +380,16 @@ struct AppState {
       extract_thread.join();
     if (preview_texture)
       glDeleteTextures(1, &preview_texture);
+    if (!drag_out_temp_path.empty()) {
+      std::error_code ec;
+      std::filesystem::remove(drag_out_temp_path, ec);
+    }
   }
 };
+
+static bool is_password_ready(const AppState &state) {
+  return state.password_verified && state.global_password[0] != '\0';
+}
 
 // ============================================================
 // UI Panels
@@ -289,7 +401,7 @@ static bool render_menu_bar(AppState &state, bool &show_hex) {
   if (ImGui::BeginMainMenuBar()) {
     if (ImGui::BeginMenu("File")) {
       if (ImGui::MenuItem("Open Archive...", "Ctrl+O"))
-        ImGui::OpenPopup("##open_dlg");
+        state.open_dialog_requested = true;
       if (state.archive_open && ImGui::MenuItem("Extract All...")) {
         auto out = std::filesystem::current_path() / "extracted";
         state.start_extract_all(out);
@@ -379,29 +491,6 @@ static bool render_menu_bar(AppState &state, bool &show_hex) {
     ImGui::EndMainMenuBar();
   }
 
-  if (state.open_dialog_requested) {
-    ImGui::OpenPopup("##open_dlg");
-    state.open_dialog_requested = false;
-  }
-
-  // Inline open-archive dialog
-  if (ImGui::BeginPopup("##open_dlg")) {
-    static char path_buf[512] = {};
-    ImGui::Text("Archive path:");
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(360.f);
-    ImGui::InputText("##path", path_buf, sizeof(path_buf));
-    ImGui::SameLine();
-    if (ImGui::Button("Open") && path_buf[0]) {
-      state.open(path_buf);
-      path_buf[0] = '\0'; // clear for next use
-      ImGui::CloseCurrentPopup();
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Cancel"))
-      ImGui::CloseCurrentPopup();
-    ImGui::EndPopup();
-  }
   return quit;
 }
 
@@ -474,33 +563,8 @@ static void render_explorer(AppState &state) {
           visible.push_back(&e);
       }
 
-      if (ImGuiTableSortSpecs *specs = ImGui::TableGetSortSpecs()) {
-        if (specs->SpecsCount > 0) {
-          const int col = specs->Specs[0].ColumnIndex;
-          const bool asc =
-              (specs->Specs[0].SortDirection == ImGuiSortDirection_Ascending);
-          std::sort(visible.begin(), visible.end(),
-                    [&](const vfs::ArchiveReader::FileEntry *a,
-                        const vfs::ArchiveReader::FileEntry *b) {
-                      auto cmp = [&]() -> int {
-                        if (col == 0)
-                          return a->path.compare(b->path);
-                        if (col == 1)
-                          return (a->size < b->size)   ? -1
-                                 : (a->size > b->size) ? 1
-                                                       : 0;
-                        if (col == 2)
-                          return (a->compressed_size < b->compressed_size) ? -1
-                                 : (a->compressed_size > b->compressed_size)
-                                     ? 1
-                                     : 0;
-                        return 0;
-                      };
-                      return asc ? cmp() < 0 : cmp() > 0;
-                    });
-          specs->SpecsDirty = false;
-        }
-      }
+      if (ImGuiTableSortSpecs *specs = ImGui::TableGetSortSpecs())
+        sort_file_entries(visible, specs, true);
 
       for (const auto *ep : visible) {
         ImGui::TableNextRow();
@@ -518,7 +582,12 @@ static void render_explorer(AppState &state) {
         }
         if (ImGui::IsItemActive() &&
             ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-          state.drag_out_pending = ep->path;
+          if (entry_is_encrypted(*ep) && !is_password_ready(state)) {
+            std::snprintf(state.status_msg, sizeof(state.status_msg),
+                          "Cannot extract: verify the archive password first.");
+          } else {
+            state.drag_out_pending = ep->path;
+          }
         }
         if (ImGui::BeginPopupContextItem()) {
           ImGui::Text("  %s", ep->path.c_str());
@@ -529,6 +598,9 @@ static void render_explorer(AppState &state) {
             if (state.extracting.load()) {
               std::snprintf(state.status_msg, sizeof(state.status_msg),
                             "Cannot delete: extraction in progress.");
+            } else if (state.archive_encrypted && !is_password_ready(state)) {
+              std::snprintf(state.status_msg, sizeof(state.status_msg),
+                            "Cannot delete: verify the archive password first.");
             } else {
               vfs::ArchiveWriter writer;
               std::string path_to_del = ep->path;
@@ -536,13 +608,13 @@ static void render_explorer(AppState &state) {
               state.reader->close(); // unlock file handle
               auto res = writer.delete_file(path_to_del, arc_path);
               if (res) {
-                std::snprintf(state.status_msg, sizeof(state.status_msg),
-                              "Deleted: %s", path_to_del.c_str());
+                state.refresh_status = "Deleted: " + path_to_del;
               } else {
-                std::snprintf(state.status_msg, sizeof(state.status_msg),
-                              "Delete failed (error %d)",
-                              static_cast<int>(res.error()));
+                state.refresh_status = "Delete failed (error " +
+                                       std::to_string(static_cast<int>(res.error())) +
+                                       ")";
               }
+              state.refresh_path = arc_path;
               state.refresh_requested = true;
             }
           }
@@ -550,6 +622,12 @@ static void render_explorer(AppState &state) {
             if (state.extracting.load()) {
               std::snprintf(state.status_msg, sizeof(state.status_msg),
                             "Extraction already in progress.");
+              ImGui::EndPopup();
+              continue;
+            }
+            if (entry_is_encrypted(*ep) && !is_password_ready(state)) {
+              std::snprintf(state.status_msg, sizeof(state.status_msg),
+                            "Cannot extract: verify the archive password first.");
               ImGui::EndPopup();
               continue;
             }
@@ -594,6 +672,11 @@ static void render_explorer(AppState &state) {
           ImGui::TextDisabled("Raw");
       }
     } else if (state.current_dir) {
+      std::vector<const vfs::ArchiveReader::FileEntry *> files =
+          state.current_dir->files;
+      if (ImGuiTableSortSpecs *specs = ImGui::TableGetSortSpecs())
+        sort_file_entries(files, specs, false);
+
       if (state.current_dir->parent) {
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
@@ -631,7 +714,7 @@ static void render_explorer(AppState &state) {
         ImGui::TextUnformatted("-");
       }
 
-      for (const auto *ep : state.current_dir->files) {
+      for (const auto *ep : files) {
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
         std::string filename =
@@ -649,7 +732,12 @@ static void render_explorer(AppState &state) {
         }
         if (ImGui::IsItemActive() &&
             ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-          state.drag_out_pending = ep->path;
+          if (entry_is_encrypted(*ep) && !is_password_ready(state)) {
+            std::snprintf(state.status_msg, sizeof(state.status_msg),
+                          "Cannot extract: verify the archive password first.");
+          } else {
+            state.drag_out_pending = ep->path;
+          }
         }
         if (ImGui::BeginPopupContextItem()) {
           ImGui::Text("  %s", filename.c_str());
@@ -660,6 +748,9 @@ static void render_explorer(AppState &state) {
             if (state.extracting.load()) {
               std::snprintf(state.status_msg, sizeof(state.status_msg),
                             "Cannot delete: extraction in progress.");
+            } else if (state.archive_encrypted && !is_password_ready(state)) {
+              std::snprintf(state.status_msg, sizeof(state.status_msg),
+                            "Cannot delete: verify the archive password first.");
             } else {
               vfs::ArchiveWriter writer;
               std::string path_to_del = ep->path;
@@ -667,13 +758,13 @@ static void render_explorer(AppState &state) {
               state.reader->close(); // unlock file handle
               auto res = writer.delete_file(path_to_del, arc_path);
               if (res) {
-                std::snprintf(state.status_msg, sizeof(state.status_msg),
-                              "Deleted: %s", path_to_del.c_str());
+                state.refresh_status = "Deleted: " + path_to_del;
               } else {
-                std::snprintf(state.status_msg, sizeof(state.status_msg),
-                              "Delete failed (error %d)",
-                              static_cast<int>(res.error()));
+                state.refresh_status = "Delete failed (error " +
+                                       std::to_string(static_cast<int>(res.error())) +
+                                       ")";
               }
+              state.refresh_path = arc_path;
               state.refresh_requested = true;
             }
           }
@@ -681,6 +772,12 @@ static void render_explorer(AppState &state) {
             if (state.extracting.load()) {
               std::snprintf(state.status_msg, sizeof(state.status_msg),
                             "Extraction already in progress.");
+              ImGui::EndPopup();
+              continue;
+            }
+            if (entry_is_encrypted(*ep) && !is_password_ready(state)) {
+              std::snprintf(state.status_msg, sizeof(state.status_msg),
+                            "Cannot extract: verify the archive password first.");
               ImGui::EndPopup();
               continue;
             }
@@ -929,6 +1026,14 @@ int main(int argc, char **argv) {
       // archive
       if (event.type == SDL_DROPFILE && event.drop.file) {
         std::filesystem::path dropped_path(event.drop.file);
+        if (!state.drag_out_temp_path.empty() &&
+            dropped_path == state.drag_out_temp_path) {
+          std::error_code ec;
+          std::filesystem::remove(state.drag_out_temp_path, ec);
+          state.drag_out_temp_path.clear();
+          SDL_free(event.drop.file);
+          continue;
+        }
         if (state.archive_open && dropped_path.extension() != ".avv" &&
             std::filesystem::is_regular_file(dropped_path)) {
           vfs::ArchiveWriter writer;
@@ -989,15 +1094,14 @@ int main(int argc, char **argv) {
           auto res = writer.append_file(dropped_path, virtual_path, arc_path,
                                         cmp_level, enc);
           if (res) {
-            std::snprintf(state.status_msg, sizeof(state.status_msg),
-                          "Appended: %s", virtual_path.c_str());
-            state.open(arc_path); // Refresh the view
+            state.refresh_status = "Appended: " + virtual_path;
           } else {
-            std::snprintf(state.status_msg, sizeof(state.status_msg),
-                          "Failed to append (error %d)",
-                          static_cast<int>(res.error()));
-            state.open(arc_path); // Re-open anyway to restore access
+            state.refresh_status = "Failed to append (error " +
+                                   std::to_string(static_cast<int>(res.error())) +
+                                   ")";
           }
+          state.refresh_path = arc_path;
+          state.refresh_requested = true;
         } else {
           state.open(event.drop.file);
         }
@@ -1018,6 +1122,18 @@ int main(int argc, char **argv) {
 
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O, false))
       state.open_dialog_requested = true;
+
+    if (state.open_dialog_requested) {
+#ifdef _WIN32
+      const std::wstring selected = Win32OpenArchiveDialog(sdl_hwnd(window));
+      if (!selected.empty())
+        state.open(narrow_from_wide(selected));
+#else
+      std::snprintf(state.status_msg, sizeof(state.status_msg),
+                    "Native file dialog is only implemented on Windows.");
+#endif
+      state.open_dialog_requested = false;
+    }
 
     // Full-window dockspace
     ImGuiViewport *vp = ImGui::GetMainViewport();
@@ -1098,46 +1214,65 @@ int main(int argc, char **argv) {
       std::string path_to_extract = state.drag_out_pending;
       state.drag_out_pending.clear();
 
-      auto temp_dir = std::filesystem::temp_directory_path();
-      auto full_out_path =
-          temp_dir / std::filesystem::path(path_to_extract).filename();
+      const auto &entries = state.reader->get_entries();
+      auto it = std::find_if(entries.begin(), entries.end(), [&](const auto &e) {
+        return e.path == path_to_extract;
+      });
+      if (it != entries.end() && entry_is_encrypted(*it) &&
+          !is_password_ready(state)) {
+        std::snprintf(state.status_msg, sizeof(state.status_msg),
+                      "Cannot extract: verify the archive password first.");
+      } else {
+        if (!state.drag_out_temp_path.empty()) {
+          std::error_code cleanup_ec;
+          std::filesystem::remove(state.drag_out_temp_path, cleanup_ec);
+          state.drag_out_temp_path.clear();
+        }
+        const auto full_out_path = make_drag_temp_path(path_to_extract);
+        state.drag_out_temp_path = full_out_path;
 
-      state.extracting.store(true);
-      state.extract_current.store(0);
-      state.extract_total.store(1);
-      state.extract_succeeded.store(false);
-      {
-        std::lock_guard<std::mutex> lk(state.extract_mutex);
-        state.extract_current_file = path_to_extract;
-      }
-
-      state.reader->extract_file_async(
-          path_to_extract, full_out_path,
-          [&state, path_to_extract, full_out_path](vfs::Result<void> res) {
-            state.extract_succeeded.store(res.has_value());
-            state.extracting.store(false);
-            if (res) {
 #ifdef _WIN32
-              std::wstring wpath = full_out_path.wstring();
-              Win32DoDragDrop(wpath);
-              ImGui::GetIO().ClearInputMouse();
+        auto reader_ref = state.reader;
+        const std::string password = state.global_password;
+        const DWORD effect = Win32DoDragDrop(
+            full_out_path.wstring(),
+            [reader_ref, path_to_extract, full_out_path, password]() -> bool {
+              std::error_code ec;
+              std::filesystem::create_directories(full_out_path.parent_path(),
+                                                  ec);
+              auto res =
+                  reader_ref->extract_file(path_to_extract, full_out_path, password);
+              return res.has_value();
+            });
+        ImGui::GetIO().ClearInputMouse();
+        if (effect != 0) {
+          std::snprintf(state.status_msg, sizeof(state.status_msg),
+                        "Dragged out: %s", path_to_extract.c_str());
+        } else {
+          std::snprintf(state.status_msg, sizeof(state.status_msg),
+                        "Drag canceled: %s", path_to_extract.c_str());
+          std::error_code cleanup_ec;
+          std::filesystem::remove(full_out_path, cleanup_ec);
+          state.drag_out_temp_path.clear();
+        }
+#else
+        std::snprintf(state.status_msg, sizeof(state.status_msg),
+                      "Native drag-out is only implemented on Windows.");
 #endif
-              std::snprintf(state.status_msg, sizeof(state.status_msg),
-                            "Extracted (Drag & Drop): %s",
-                            path_to_extract.c_str());
-            } else {
-              std::snprintf(state.status_msg, sizeof(state.status_msg),
-                            "Drag & Drop failed (error %d)",
-                            static_cast<int>(res.error()));
-            }
-          },
-          state.global_password);
+      }
     }
 
     // Process deferred archive refresh outside of any ImGui widget tree loops
-    if (state.refresh_requested && state.archive_open) {
+    if (state.refresh_requested && !state.refresh_path.empty()) {
+      const std::string path = state.refresh_path;
+      const std::string msg = state.refresh_status;
       state.refresh_requested = false;
-      state.open(state.archive_path_str);
+      state.refresh_path.clear();
+      state.refresh_status.clear();
+      state.open(path);
+      if (state.archive_open && !msg.empty())
+        std::snprintf(state.status_msg, sizeof(state.status_msg), "%s",
+                      msg.c_str());
     }
 
     // Render

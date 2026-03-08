@@ -895,6 +895,41 @@ TEST_CASE("AVV4 Append Encrypted File", "[vfs_core][append][crypto]") {
   std::filesystem::remove(new_file);
 }
 
+TEST_CASE("AVV4 Delete File Compacts Archive", "[vfs_core][delete]") {
+  const std::filesystem::path test_dir = "delete_in";
+  const std::filesystem::path out_dir = "delete_out";
+  const std::filesystem::path archive = "delete.avv";
+
+  std::filesystem::remove_all(test_dir);
+  std::filesystem::remove_all(out_dir);
+  std::filesystem::remove(archive);
+  std::filesystem::create_directories(test_dir);
+
+  write_file(test_dir / "keep.txt", std::string(64, 'A'));
+  write_file(test_dir / "remove.bin", std::string(256 * 1024, 'Z'));
+
+  ArchiveWriter writer;
+  REQUIRE(writer.pack_directory(test_dir, archive).has_value());
+  const auto size_before = std::filesystem::file_size(archive);
+
+  REQUIRE(writer.delete_file("remove.bin", archive).has_value());
+  const auto size_after = std::filesystem::file_size(archive);
+  CHECK(size_after < size_before);
+
+  ArchiveReader reader;
+  REQUIRE(reader.open(archive).has_value());
+  REQUIRE(reader.get_entries().size() == 1);
+  CHECK(reader.get_entries()[0].path == "keep.txt");
+  REQUIRE(reader.unpack_all(out_dir).has_value());
+  CHECK(read_file(out_dir / "keep.txt") == std::string(64, 'A'));
+
+  reader.close();
+
+  std::filesystem::remove_all(test_dir);
+  std::filesystem::remove_all(out_dir);
+  std::filesystem::remove(archive);
+}
+
 // ===========================================================================
 // ThreadPool and MemoryArena Tests
 // ===========================================================================
