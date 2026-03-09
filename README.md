@@ -17,7 +17,6 @@ AVV-Archive-Toolkit/
 
 - **[VFS CLI Guide](CLI_MANUAL.md)** - Guide for packing and unpacking archives with `vfs_cli`.
 - **[Virtual File Browser GUI Guide](VFB_MANUAL.md)** - Guide for exploring, extracting, and appending archives with `vfs_browser`.
-- **[Mounted File System Implementation Artifact](MOUNTED_FILESYSTEM_IMPLEMENTATION_ARTIFACT.md)** - Design and implementation notes for mounted archive and host-directory namespaces.
 
 ## Quick Start
 

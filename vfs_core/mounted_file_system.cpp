@@ -145,19 +145,30 @@ Result<uint32_t> MountedFileSystem::mount_impl(
 }
 
 Result<void> MountedFileSystem::unmount(uint32_t mount_id) {
-  std::lock_guard<std::mutex> lock(rebuild_mutex_);
-  const auto it = mounts_.find(mount_id);
-  if (it == mounts_.end())
-    return unexpected<ErrorCode>(ErrorCode::MountNotFound);
-  mounts_.erase(it);
-  return rebuild_snapshot_locked();
+  std::shared_ptr<MountRecord> removed_mount;
+  Result<void> rebuild_res;
+  {
+    std::lock_guard<std::mutex> lock(rebuild_mutex_);
+    const auto it = mounts_.find(mount_id);
+    if (it == mounts_.end())
+      return unexpected<ErrorCode>(ErrorCode::MountNotFound);
+    removed_mount = it->second;
+    mounts_.erase(it);
+    rebuild_res = rebuild_snapshot_locked();
+  }
+  removed_mount.reset();
+  return rebuild_res;
 }
 
 void MountedFileSystem::unmount_all() {
-  std::lock_guard<std::mutex> lock(rebuild_mutex_);
-  mounts_.clear();
-  snapshot_.store(std::shared_ptr<const NamespaceSnapshot>(
-      std::make_shared<NamespaceSnapshot>()));
+  decltype(mounts_) removed_mounts;
+  {
+    std::lock_guard<std::mutex> lock(rebuild_mutex_);
+    removed_mounts.swap(mounts_);
+    snapshot_.store(std::shared_ptr<const NamespaceSnapshot>(
+        std::make_shared<NamespaceSnapshot>()));
+  }
+  removed_mounts.clear();
 }
 
 bool MountedFileSystem::is_mounted() const {
