@@ -13,13 +13,14 @@
  */
 #define CATCH_CONFIG_MAIN
 #include "../vfs_core/archive_reader.h"
-#include "../vfs_core/mounted_file_system.h"
 #include "../vfs_core/archive_writer.h"
+#include "../vfs_core/mounted_file_system.h"
 #include "catch2/catch.hpp"
 #include <filesystem>
 #include <fstream>
 #include <random>
 #include <string>
+
 
 using namespace vfs;
 
@@ -646,7 +647,8 @@ TEST_CASE("Split Archive Tamper Detection", "[vfs_core][crypto][split]") {
   REQUIRE(writer.pack_directory_split(test_dir, stem).has_value());
 
   {
-    std::fstream f(chunk_archive, std::ios::binary | std::ios::in | std::ios::out);
+    std::fstream f(chunk_archive,
+                   std::ios::binary | std::ios::in | std::ios::out);
     REQUIRE(f.is_open());
     f.seekg(0, std::ios::beg);
     char c;
@@ -1077,14 +1079,14 @@ TEST_CASE("Mounted FS - Archive and Host Directory", "[vfs_core][mount]") {
   {
     MountedFileSystem fs;
     REQUIRE(fs.mount_archive(archive).has_value());
-    REQUIRE(fs.mount_host_directory(
-                host_in, {"/", 100, PathCasePolicy::HostNative, ""})
+    REQUIRE(fs.mount_host_directory(host_in,
+                                    {"/", 100, PathCasePolicy::HostNative, ""})
                 .has_value());
 
     auto archive_read = fs.read_file_data("/config/base.txt");
     REQUIRE(archive_read.has_value());
-    CHECK(std::string(archive_read.value().begin(), archive_read.value().end()) ==
-          "base");
+    CHECK(std::string(archive_read.value().begin(),
+                      archive_read.value().end()) == "base");
 
     auto host_read = fs.read_file_data("/mods/override.txt");
     REQUIRE(host_read.has_value());
@@ -1126,12 +1128,12 @@ TEST_CASE("Mounted FS - Overlay Priority", "[vfs_core][mount]") {
 
   {
     MountedFileSystem fs;
-    REQUIRE(fs.mount_archive(
-                a_archive, {"/", 0, PathCasePolicy::ArchiveExact, ""})
-                .has_value());
-    REQUIRE(fs.mount_archive(
-                b_archive, {"/", 10, PathCasePolicy::ArchiveExact, ""})
-                .has_value());
+    REQUIRE(
+        fs.mount_archive(a_archive, {"/", 0, PathCasePolicy::ArchiveExact, ""})
+            .has_value());
+    REQUIRE(
+        fs.mount_archive(b_archive, {"/", 10, PathCasePolicy::ArchiveExact, ""})
+            .has_value());
 
     auto data = fs.read_file_data("/same.txt");
     REQUIRE(data.has_value());
@@ -1230,7 +1232,8 @@ TEST_CASE("Mounted FS - HostNative Lookup Is Case Insensitive On Windows",
   std::filesystem::remove_all(host_dir);
 }
 
-TEST_CASE("Mounted FS - list_directory Rejects File Paths", "[vfs_core][mount]") {
+TEST_CASE("Mounted FS - list_directory Rejects File Paths",
+          "[vfs_core][mount]") {
   const std::filesystem::path host_dir = "mount_list_file";
   std::filesystem::remove_all(host_dir);
   std::filesystem::create_directories(host_dir);
@@ -1275,4 +1278,54 @@ TEST_CASE("Mounted FS - Host Async Callback Survives Unmount",
   CHECK(callback_ok.load());
 
   std::filesystem::remove_all(host_dir);
+}
+
+TEST_CASE("Mounted FS - Case Policy Strictness", "[vfs_core][mount]") {
+  const std::filesystem::path sensitive_dir = "mount_strict_sensitive";
+  const std::filesystem::path insensitive_dir = "mount_strict_insensitive";
+
+  std::filesystem::remove_all(sensitive_dir);
+  std::filesystem::remove_all(insensitive_dir);
+  std::filesystem::create_directories(sensitive_dir);
+  std::filesystem::create_directories(insensitive_dir);
+
+  write_file(sensitive_dir / "StrictFile.txt", "sensitive");
+  write_file(insensitive_dir / "EasyFile.txt", "insensitive");
+
+  MountedFileSystem fs;
+
+  // 1. Mount sensitive (ForceSensitive to be sure, regardless of OS)
+  REQUIRE(
+      fs.mount_host_directory(
+            sensitive_dir, {"/strict", 0, PathCasePolicy::ForceSensitive, ""})
+          .has_value());
+
+  // 2. Mount insensitive
+  REQUIRE(
+      fs.mount_host_directory(
+            insensitive_dir, {"/easy", 0, PathCasePolicy::ForceInsensitive, ""})
+          .has_value());
+
+  SECTION("Strict mount rejects mismatched cases") {
+    CHECK(fs.exists("/strict/StrictFile.txt").value());
+    CHECK_FALSE(fs.exists("/strict/strictfile.txt").value());
+    CHECK_FALSE(fs.exists("/strict/STRICTFILE.TXT").value());
+
+    auto res = fs.stat("/strict/strictfile.txt");
+    REQUIRE_FALSE(res.has_value());
+    CHECK(res.error() == ErrorCode::FileNotFound);
+  }
+
+  SECTION("Insensitive mount accepts mismatched cases") {
+    CHECK(fs.exists("/easy/EasyFile.txt").value());
+    CHECK(fs.exists("/easy/easyfile.txt").value());
+    CHECK(fs.exists("/easy/EASYFILE.TXT").value());
+
+    auto res = fs.stat("/easy/easyfile.txt");
+    REQUIRE(res.has_value());
+    CHECK(res.value().virtual_path == "/easy/EasyFile.txt");
+  }
+
+  std::filesystem::remove_all(sensitive_dir);
+  std::filesystem::remove_all(insensitive_dir);
 }

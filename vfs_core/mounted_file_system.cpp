@@ -1,4 +1,5 @@
 #include "mounted_file_system.h"
+#include "path_utils.h"
 #include <algorithm>
 #include <set>
 
@@ -48,8 +49,8 @@ bool entry_precedes(const MountedFileSystem::VisibleEntry &lhs,
   return lhs.mount_order > rhs.mount_order;
 }
 
-MountedFileSystem::MountedEntry make_mounted_entry(
-    const MountedFileSystem::VisibleEntry &entry) {
+MountedFileSystem::MountedEntry
+make_mounted_entry(const MountedFileSystem::VisibleEntry &entry) {
   MountedFileSystem::MountedEntry result;
   result.virtual_path = entry.virtual_path;
   result.source_root = entry.source_root;
@@ -97,9 +98,10 @@ MountedFileSystem::mount_host_directory(const std::filesystem::path &host_dir,
   return mount_impl(MountSourceKind::HostDirectory, host_dir, options);
 }
 
-Result<uint32_t> MountedFileSystem::mount_impl(
-    MountSourceKind source_kind, const std::filesystem::path &source_root,
-    MountOptions options) {
+Result<uint32_t>
+MountedFileSystem::mount_impl(MountSourceKind source_kind,
+                              const std::filesystem::path &source_root,
+                              MountOptions options) {
   auto mount_point_res = normalize_mount_point(options.mount_point);
   if (!mount_point_res)
     return unexpected<ErrorCode>(ErrorCode::InvalidMountPoint);
@@ -115,7 +117,8 @@ Result<uint32_t> MountedFileSystem::mount_impl(
 
   std::shared_ptr<IMountedSource> source;
   if (source_kind == MountSourceKind::Archive) {
-    source = std::make_shared<ArchiveMountedSource>(source_root, options.password);
+    source =
+        std::make_shared<ArchiveMountedSource>(source_root, options.password);
   } else {
     source = std::make_shared<HostDirectoryMountedSource>(source_root);
   }
@@ -182,8 +185,8 @@ Result<void> MountedFileSystem::rebuild_snapshot_locked() {
 
   for (const auto &[mount_id, mount] : mounts_) {
     for (const auto &entry : mount->source->entries()) {
-      auto virtual_path_res =
-          join_mount_point_and_relative_path(mount->mount_point, entry.source_path);
+      auto virtual_path_res = join_mount_point_and_relative_path(
+          mount->mount_point, entry.source_path);
       if (!virtual_path_res)
         return unexpected<ErrorCode>(virtual_path_res.error());
 
@@ -244,7 +247,8 @@ Result<void> MountedFileSystem::rebuild_snapshot_locked() {
         snap->canonical_to_display_path[parent_key] = parent;
       }
       auto &children = snap->directory_children_by_key[parent_key];
-      if (std::find(children.begin(), children.end(), child_key) == children.end())
+      if (std::find(children.begin(), children.end(), child_key) ==
+          children.end())
         children.push_back(child_key);
       child_key = parent_key;
     }
@@ -257,8 +261,9 @@ Result<void> MountedFileSystem::rebuild_snapshot_locked() {
 
   for (const auto &[key, entry] : snap->visible_entries_by_key) {
     const std::size_t slash = entry.virtual_path.find_last_of('/');
-    const std::string parent_path =
-        (slash == 0 || slash == std::string::npos) ? "/" : entry.virtual_path.substr(0, slash);
+    const std::string parent_path = (slash == 0 || slash == std::string::npos)
+                                        ? "/"
+                                        : entry.virtual_path.substr(0, slash);
     const std::string parent_key =
         canonicalize_virtual_path(parent_path, entry.case_policy);
     auto &children = snap->directory_children_by_key[parent_key];
@@ -270,8 +275,8 @@ Result<void> MountedFileSystem::rebuild_snapshot_locked() {
   return {};
 }
 
-Result<std::string>
-MountedFileSystem::normalize_lookup_path(const std::string &virtual_path) const {
+Result<std::string> MountedFileSystem::normalize_lookup_path(
+    const std::string &virtual_path) const {
   return normalize_virtual_path(virtual_path, true);
 }
 
@@ -293,12 +298,26 @@ Result<bool> MountedFileSystem::exists(const std::string &virtual_path) const {
     return unexpected<ErrorCode>(path_res.error());
   auto snap = snapshot_.load();
   const std::string exact_key = path_res.value();
-  const std::string folded_key = alternate_lookup_key(path_res.value());
   if (snap->visible_entries_by_key.count(exact_key) > 0 ||
-      snap->visible_entries_by_key.count(folded_key) > 0 ||
-      snap->canonical_to_display_path.count(exact_key) > 0 ||
-      snap->canonical_to_display_path.count(folded_key) > 0)
+      snap->canonical_to_display_path.count(exact_key) > 0)
     return true;
+
+  const std::string folded_key = alternate_lookup_key(exact_key);
+  auto it = snap->visible_entries_by_key.find(folded_key);
+  if (it != snap->visible_entries_by_key.end() &&
+      !path_policy_is_case_sensitive(it->second.case_policy))
+    return true;
+
+  auto dir_it = snap->canonical_to_display_path.find(folded_key);
+  if (dir_it != snap->canonical_to_display_path.end()) {
+    // For directories, we need to check if ANY mount that contributes to this
+    // directory is case-insensitive. In this implementation, directory
+    // existence is generally case-insensitive if the underlying system allows
+    // it. However, to be strict, we'd need to track per-directory policy. For
+    // now, we allow folded directory matches.
+    return true;
+  }
+
   return false;
 }
 
@@ -309,22 +328,39 @@ MountedFileSystem::stat(const std::string &virtual_path) const {
     return unexpected<ErrorCode>(path_res.error());
   auto snap = snapshot_.load();
   const std::string exact_key = path_res.value();
-  const std::string folded_key = alternate_lookup_key(path_res.value());
+
+  // 1. Exact file match
   auto file_it = snap->visible_entries_by_key.find(exact_key);
-  if (file_it == snap->visible_entries_by_key.end())
-    file_it = snap->visible_entries_by_key.find(folded_key);
   if (file_it != snap->visible_entries_by_key.end())
     return to_mounted_entry(file_it->second);
 
+  // 2. Exact directory match
   auto dir_it = snap->canonical_to_display_path.find(exact_key);
-  if (dir_it == snap->canonical_to_display_path.end())
-    dir_it = snap->canonical_to_display_path.find(folded_key);
   if (dir_it != snap->canonical_to_display_path.end()) {
     VisibleEntry dir_entry;
     dir_entry.virtual_path = dir_it->second;
     dir_entry.is_directory = true;
     return to_mounted_entry(dir_entry);
   }
+
+  // 3. Folded fallback
+  const std::string folded_key = alternate_lookup_key(exact_key);
+
+  // Case-insensitive file match
+  file_it = snap->visible_entries_by_key.find(folded_key);
+  if (file_it != snap->visible_entries_by_key.end() &&
+      !path_policy_is_case_sensitive(file_it->second.case_policy))
+    return to_mounted_entry(file_it->second);
+
+  // Case-insensitive directory match
+  dir_it = snap->canonical_to_display_path.find(folded_key);
+  if (dir_it != snap->canonical_to_display_path.end()) {
+    VisibleEntry dir_entry;
+    dir_entry.virtual_path = dir_it->second;
+    dir_entry.is_directory = true;
+    return to_mounted_entry(dir_entry);
+  }
+
   return unexpected<ErrorCode>(ErrorCode::FileNotFound);
 }
 
@@ -351,15 +387,19 @@ MountedFileSystem::list_directory(const std::string &virtual_dir) const {
   auto snap = snapshot_.load();
 
   std::string dir_key = path_res.value();
-  if (snap->canonical_to_display_path.count(dir_key) == 0) {
-    dir_key = alternate_lookup_key(path_res.value());
+  if (snap->canonical_to_display_path.count(dir_key) == 0 && dir_key != "/") {
+    const std::string folded = alternate_lookup_key(dir_key);
+    if (snap->canonical_to_display_path.count(folded) > 0) {
+      dir_key = folded;
+    }
   }
-  if (path_res.value() != "/" &&
-      snap->visible_entries_by_key.count(dir_key) > 0 &&
+
+  if (dir_key != "/" && snap->visible_entries_by_key.count(dir_key) > 0 &&
       snap->directory_children_by_key.count(dir_key) == 0) {
     return unexpected<ErrorCode>(ErrorCode::NotADirectory);
   }
-  if (snap->canonical_to_display_path.count(dir_key) == 0 && path_res.value() != "/")
+
+  if (snap->canonical_to_display_path.count(dir_key) == 0 && dir_key != "/")
     return unexpected<ErrorCode>(ErrorCode::NotADirectory);
 
   const auto child_it = snap->directory_children_by_key.find(dir_key);
@@ -388,12 +428,13 @@ MountedFileSystem::list_directory(const std::string &virtual_dir) const {
                 return lhs.is_directory > rhs.is_directory;
               return lhs.virtual_path < rhs.virtual_path;
             });
-  result.erase(std::unique(result.begin(), result.end(),
-                           [](const MountedEntry &lhs, const MountedEntry &rhs) {
-                             return lhs.virtual_path == rhs.virtual_path &&
-                                    lhs.is_directory == rhs.is_directory;
-                           }),
-               result.end());
+  result.erase(
+      std::unique(result.begin(), result.end(),
+                  [](const MountedEntry &lhs, const MountedEntry &rhs) {
+                    return lhs.virtual_path == rhs.virtual_path &&
+                           lhs.is_directory == rhs.is_directory;
+                  }),
+      result.end());
   return result;
 }
 
@@ -403,12 +444,28 @@ MountedFileSystem::list_overlays(const std::string &virtual_path) const {
   if (!path_res)
     return unexpected<ErrorCode>(path_res.error());
   auto snap = snapshot_.load();
-  std::string key = path_res.value();
-  auto it = snap->overlays_by_key.find(key);
+  const std::string exact_key = path_res.value();
+
+  auto it = snap->overlays_by_key.find(exact_key);
   if (it == snap->overlays_by_key.end()) {
-    key = alternate_lookup_key(path_res.value());
-    it = snap->overlays_by_key.find(key);
+    const std::string folded = alternate_lookup_key(exact_key);
+    it = snap->overlays_by_key.find(folded);
+    if (it != snap->overlays_by_key.end()) {
+      // Check if ANY entry in the overlay stack allows case-insensitivity.
+      // Usually, if we're doing a folded lookup, we only want to return results
+      // from mounts that allow it.
+      bool any_insensitive = false;
+      for (const auto &e : it->second) {
+        if (!path_policy_is_case_sensitive(e.case_policy)) {
+          any_insensitive = true;
+          break;
+        }
+      }
+      if (!any_insensitive)
+        it = snap->overlays_by_key.end();
+    }
   }
+
   if (it != snap->overlays_by_key.end()) {
     std::vector<MountedEntry> result;
     result.reserve(it->second.size());
