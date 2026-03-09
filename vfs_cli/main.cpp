@@ -51,9 +51,9 @@ static void print_usage(const char *prog) {
             << "  [--unmount <mount-number>]...\n"
             << "\nMount specs:\n"
             << "  --archive <path> [--at <mount>] [--priority <n>] [--key "
-                "<pass>] [--case <archive|host|sensitive|insensitive>]\n"
+               "<pass>] [--case <archive|host|sensitive|insensitive>]\n"
             << "  --dir <path>     [--at <mount>] [--priority <n>] [--case "
-                "<archive|host|sensitive|insensitive>]\n";
+               "<archive|host|sensitive|insensitive>]\n";
 }
 
 static void render_progress(uint32_t current, uint32_t total,
@@ -117,7 +117,8 @@ struct ParsedMountPlan {
   std::vector<size_t> unmount_indices;
 };
 
-static bool parse_int_arg(const char *name, const std::string &value, int &out) {
+static bool parse_int_arg(const char *name, const std::string &value,
+                          int &out) {
   const char *begin = value.data();
   const char *end = begin + value.size();
   auto [ptr, ec] = std::from_chars(begin, end, out);
@@ -191,7 +192,7 @@ static bool parse_mount_plan(int start, int argc, char **argv,
     ++i;
     while (i < argc) {
       const std::string opt = argv[i];
-      if (opt == "--archive" || opt == "--dir")
+      if (opt == "--archive" || opt == "--dir" || opt == "--unmount")
         break;
       if (opt == "--at") {
         if (i + 1 >= argc) {
@@ -365,19 +366,20 @@ static int handle_vmount(int argc, char **argv, int arg_offset) {
       return 1;
     }
     const auto &entry = stat_res.value();
-    std::cout << "Virtual:  " << entry.virtual_path << "\n"
-              << "Type:     "
-              << (entry.is_directory
-                      ? "Directory"
-                      : (entry.source_kind ==
-                                 vfs::MountedFileSystem::MountSourceKind::Archive
-                             ? "Archive File"
-                             : "Host File"))
-              << "\n"
-              << "Source:   " << entry.source_root << "\n"
-              << "Path:     " << entry.source_path << "\n"
-              << "Priority: " << entry.priority << "\n"
-              << "Size:     " << format_size(entry.size) << "\n";
+    std::cout
+        << "Virtual:  " << entry.virtual_path << "\n"
+        << "Type:     "
+        << (entry.is_directory
+                ? "Directory"
+                : (entry.source_kind ==
+                           vfs::MountedFileSystem::MountSourceKind::Archive
+                       ? "Archive File"
+                       : "Host File"))
+        << "\n"
+        << "Source:   " << entry.source_root << "\n"
+        << "Path:     " << entry.source_path << "\n"
+        << "Priority: " << entry.priority << "\n"
+        << "Size:     " << format_size(entry.size) << "\n";
     return 0;
   }
 
@@ -392,12 +394,13 @@ static int handle_vmount(int argc, char **argv, int arg_offset) {
       return 1;
     auto overlays_res = fs.list_overlays(argv[arg_offset + 2]);
     if (!overlays_res) {
-      std::cerr << "Error: "
-                << vfs::error_code_to_string(overlays_res.error()) << "\n";
+      std::cerr << "Error: " << vfs::error_code_to_string(overlays_res.error())
+                << "\n";
       return 1;
     }
     for (const auto &entry : overlays_res.value()) {
-      std::printf("%4d  %-40s  %s\n", entry.priority, entry.virtual_path.c_str(),
+      std::printf("%4d  %-40s  %s\n", entry.priority,
+                  entry.virtual_path.c_str(),
                   entry.source_root.string().c_str());
     }
     return 0;
@@ -487,8 +490,8 @@ int main(int argc, char **argv) {
           (dropped.parent_path() / dropped.filename()).string();
       vfs::ArchiveWriter writer;
       auto r = writer.pack_directory_split(dropped, stem, chunk_bytes,
-                                           comp_level, render_progress, enc_opts,
-                                           enable_journal);
+                                           comp_level, render_progress,
+                                           enc_opts, enable_journal);
       if (!r) {
         std::cerr << "Error: " << vfs::error_code_to_string(r.error()) << "\n";
         rc = 1;
@@ -580,10 +583,9 @@ int main(int argc, char **argv) {
       return 1;
     }
     vfs::ArchiveWriter writer;
-    auto r = writer.pack_directory_split(argv[arg_offset + 2], argv[arg_offset + 1],
-                                         chunk_bytes, comp_level,
-                                         render_progress, enc_opts,
-                                         enable_journal);
+    auto r = writer.pack_directory_split(
+        argv[arg_offset + 2], argv[arg_offset + 1], chunk_bytes, comp_level,
+        render_progress, enc_opts, enable_journal);
     if (!r) {
       std::cerr << "Error: " << vfs::error_code_to_string(r.error()) << "\n";
       return 1;
