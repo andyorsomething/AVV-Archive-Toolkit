@@ -154,6 +154,11 @@ writer.pack_directory_split("assets/", "game_data", 4ULL * 1024 * 1024 * 1024, 9
 | `ArchiveTooLarge` | A split archive would exceed the format's chunk-count limit |
 | `HashMismatch` | The computed integrity hash does not match the stored hash |
 | `DecryptionFailed` | The file payload could not be decrypted |
+| `AlreadyMounted` | The requested source is already mounted at this location |
+| `MountNotFound` | The requested mount ID does not exist |
+| `PathConflict` | The mount/path would create an ambiguous or overlapping entry |
+| `InvalidMountPoint` | The provided mount point is malformed or invalid |
+| `NotADirectory` | The operation requires a directory but found a file |
 
 ### `Result<T>` pattern
 

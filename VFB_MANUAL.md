@@ -44,6 +44,11 @@ The browser surfaces core VFS errors in status messages and dialogs using the nu
 | `7` | `Archive Too Large` | The requested write operation exceeds a format limit. |
 | `8` | `Hash Mismatch (Integrity Error)` | The archive integrity check failed; the archive may be damaged or tampered with. |
 | `9` | `Decryption Failed` | The password is wrong, missing, or the encrypted payload could not be decoded. |
+| `10` | `Already Mounted` | The requested source is already mounted at this location. |
+| `11` | `Mount Not Found` | The requested mount ID does not exist. |
+| `12` | `Path Conflict` | The mount/path would create an ambiguous or overlapping entry. |
+| `13` | `Invalid Mount Point` | The provided mount point is malformed or invalid. |
+| `14` | `Not A Directory` | The operation requires a directory but found a file. |
 
 Examples:
 - `Error 8` means `Hash Mismatch (Integrity Error)`.
