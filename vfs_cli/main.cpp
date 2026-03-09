@@ -47,11 +47,13 @@ static void print_usage(const char *prog) {
             << "  " << prog << " vmount stat <virtual_path> <mount_spec>...\n"
             << "  " << prog
             << " vmount overlays <virtual_path> <mount_spec>...\n"
+            << "\nMounted query modifiers:\n"
+            << "  [--unmount <mount-number>]...\n"
             << "\nMount specs:\n"
             << "  --archive <path> [--at <mount>] [--priority <n>] [--key "
-               "<pass>] [--case <archive|host|sensitive|insensitive>]\n"
+                "<pass>] [--case <archive|host|sensitive|insensitive>]\n"
             << "  --dir <path>     [--at <mount>] [--priority <n>] [--case "
-               "<archive|host|sensitive|insensitive>]\n";
+                "<archive|host|sensitive|insensitive>]\n";
 }
 
 static void render_progress(uint32_t current, uint32_t total,
@@ -110,6 +112,11 @@ struct MountSpec {
   vfs::MountedFileSystem::MountOptions options;
 };
 
+struct ParsedMountPlan {
+  std::vector<MountSpec> specs;
+  std::vector<size_t> unmount_indices;
+};
+
 static bool parse_int_arg(const char *name, const std::string &value, int &out) {
   const char *begin = value.data();
   const char *end = begin + value.size();
@@ -138,11 +145,27 @@ static bool parse_case_policy(const std::string &policy,
   return false;
 }
 
-static bool parse_mount_specs(int start, int argc, char **argv,
-                              std::vector<MountSpec> &specs) {
+static bool parse_mount_plan(int start, int argc, char **argv,
+                             ParsedMountPlan &plan) {
   int i = start;
   while (i < argc) {
     const std::string arg = argv[i];
+    if (arg == "--unmount") {
+      if (i + 1 >= argc) {
+        std::cerr << "Error: --unmount requires a mount number.\n";
+        return false;
+      }
+      int parsed_index = 0;
+      if (!parse_int_arg("--unmount", argv[i + 1], parsed_index))
+        return false;
+      if (parsed_index <= 0) {
+        std::cerr << "Error: --unmount mount number must be 1 or greater.\n";
+        return false;
+      }
+      plan.unmount_indices.push_back(static_cast<size_t>(parsed_index - 1));
+      i += 2;
+      continue;
+    }
     if (arg != "--archive" && arg != "--dir") {
       std::cerr << "Error: expected '--archive' or '--dir', got '" << arg
                 << "'.\n";
@@ -205,18 +228,48 @@ static bool parse_mount_specs(int start, int argc, char **argv,
         return false;
       }
     }
-    specs.push_back(std::move(spec));
+    plan.specs.push_back(std::move(spec));
   }
-  return !specs.empty();
+  if (plan.specs.empty()) {
+    std::cerr << "Error: at least one mount spec is required.\n";
+    return false;
+  }
+  for (size_t mount_index : plan.unmount_indices) {
+    if (mount_index >= plan.specs.size()) {
+      std::cerr << "Error: --unmount mount number " << (mount_index + 1)
+                << " is out of range.\n";
+      return false;
+    }
+  }
+  return true;
 }
 
 static bool mount_all(vfs::MountedFileSystem &fs,
-                      const std::vector<MountSpec> &specs) {
+                      const std::vector<MountSpec> &specs,
+                      std::vector<uint32_t> *mounted_ids = nullptr) {
   for (const auto &spec : specs) {
     vfs::Result<uint32_t> res =
         (spec.kind == vfs::MountedFileSystem::MountSourceKind::Archive)
             ? fs.mount_archive(spec.path, spec.options)
             : fs.mount_host_directory(spec.path, spec.options);
+    if (!res) {
+      std::cerr << "Error: " << vfs::error_code_to_string(res.error()) << "\n";
+      return false;
+    }
+    if (mounted_ids)
+      mounted_ids->push_back(res.value());
+  }
+  return true;
+}
+
+static bool apply_unmounts(vfs::MountedFileSystem &fs,
+                           const ParsedMountPlan &plan) {
+  std::vector<uint32_t> mounted_ids;
+  if (!mount_all(fs, plan.specs, &mounted_ids))
+    return false;
+
+  for (size_t mount_index : plan.unmount_indices) {
+    auto res = fs.unmount(mounted_ids[mount_index]);
     if (!res) {
       std::cerr << "Error: " << vfs::error_code_to_string(res.error()) << "\n";
       return false;
@@ -233,16 +286,16 @@ static int handle_vmount(int argc, char **argv, int arg_offset) {
 
   const std::string action = argv[arg_offset + 1];
   vfs::MountedFileSystem fs;
-  std::vector<MountSpec> specs;
+  ParsedMountPlan plan;
 
   if (action == "list") {
     if (arg_offset + 2 >= argc) {
       print_usage(argv[0]);
       return 1;
     }
-    if (!parse_mount_specs(arg_offset + 3, argc, argv, specs))
+    if (!parse_mount_plan(arg_offset + 3, argc, argv, plan))
       return 1;
-    if (!mount_all(fs, specs))
+    if (!apply_unmounts(fs, plan))
       return 1;
     auto list_res = fs.list_directory(argv[arg_offset + 2]);
     if (!list_res) {
@@ -263,9 +316,9 @@ static int handle_vmount(int argc, char **argv, int arg_offset) {
       print_usage(argv[0]);
       return 1;
     }
-    if (!parse_mount_specs(arg_offset + 3, argc, argv, specs))
+    if (!parse_mount_plan(arg_offset + 3, argc, argv, plan))
       return 1;
-    if (!mount_all(fs, specs))
+    if (!apply_unmounts(fs, plan))
       return 1;
     auto read_res = fs.read_file_data(argv[arg_offset + 2]);
     if (!read_res) {
@@ -284,9 +337,9 @@ static int handle_vmount(int argc, char **argv, int arg_offset) {
       print_usage(argv[0]);
       return 1;
     }
-    if (!parse_mount_specs(arg_offset + 4, argc, argv, specs))
+    if (!parse_mount_plan(arg_offset + 4, argc, argv, plan))
       return 1;
-    if (!mount_all(fs, specs))
+    if (!apply_unmounts(fs, plan))
       return 1;
     auto res = fs.extract_file(argv[arg_offset + 2], argv[arg_offset + 3]);
     if (!res) {
@@ -301,9 +354,9 @@ static int handle_vmount(int argc, char **argv, int arg_offset) {
       print_usage(argv[0]);
       return 1;
     }
-    if (!parse_mount_specs(arg_offset + 3, argc, argv, specs))
+    if (!parse_mount_plan(arg_offset + 3, argc, argv, plan))
       return 1;
-    if (!mount_all(fs, specs))
+    if (!apply_unmounts(fs, plan))
       return 1;
     auto stat_res = fs.stat(argv[arg_offset + 2]);
     if (!stat_res) {
@@ -333,9 +386,9 @@ static int handle_vmount(int argc, char **argv, int arg_offset) {
       print_usage(argv[0]);
       return 1;
     }
-    if (!parse_mount_specs(arg_offset + 3, argc, argv, specs))
+    if (!parse_mount_plan(arg_offset + 3, argc, argv, plan))
       return 1;
-    if (!mount_all(fs, specs))
+    if (!apply_unmounts(fs, plan))
       return 1;
     auto overlays_res = fs.list_overlays(argv[arg_offset + 2]);
     if (!overlays_res) {

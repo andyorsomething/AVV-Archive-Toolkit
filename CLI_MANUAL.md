@@ -49,11 +49,18 @@ Mount specs:
 --dir <path>     [--at <mount>] [--priority <n>] [--case <archive|host|sensitive|insensitive>]
 ```
 
+Mounted query modifiers:
+
+```text
+[--unmount <mount-number>]...
+```
+
 Defaults:
 
 - archive mounts default to mount point `/`, priority `0`, case policy `archive`
 - host-directory mounts default to mount point `/`, priority `0`, case policy `host`
 - higher priority wins; equal priority breaks in favor of the later mount
+- `--unmount` removes a mount spec by 1-based position before the query runs
 
 Examples:
 
@@ -70,6 +77,11 @@ Examples:
 .\vfs_cli.exe vmount stat /game/config/settings.json `
   --archive base_dir.avv --at /game `
   --dir C:\mods\live --at /game --priority 200
+
+.\vfs_cli.exe vmount list /game `
+  --archive base_dir.avv --at /game `
+  --dir C:\mods\live --at /game --priority 200 `
+  --unmount 2
 ```
 
 Mounted mode is read-only in this phase. It supports:

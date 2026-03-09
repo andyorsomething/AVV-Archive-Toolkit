@@ -138,7 +138,32 @@ To see every source contributing the same exact mounted path:
 
 The first row is the active winner. Lower rows are shadowed.
 
-## 7. Open the Same Data in the Browser
+## 7. Unmount a Layer for One CLI Query
+
+`vmount` is stateless: each command builds a temporary mounted namespace from the
+mount specs you provide. The simple CLI unmount feature removes one of those
+mount specs before the query runs.
+
+Mount numbers are 1-based in the order you write the mount specs:
+
+1. `--archive game_data.avv --at /game --priority 0`
+2. `--dir live_override --at /game --priority 100`
+
+If you want to inspect the namespace with the override removed, unmount mount `2`:
+
+```powershell
+.\vfs_cli.exe vmount stat /game/config/settings.json `
+  --archive game_data.avv --at /game --priority 0 `
+  --dir live_override --at /game --priority 100 `
+  --unmount 2
+```
+
+Now the winning source should be the archive again instead of `live_override`.
+
+You can use the same `--unmount <mount-number>` modifier with `list`, `cat`,
+`extract`, `stat`, or `overlays`.
+
+## 8. Open the Same Data in the Browser
 
 In `vfs_browser`:
 
@@ -153,5 +178,6 @@ In `vfs_browser`:
 - Archive mounts are read-only in mounted mode.
 - Host-directory mounts snapshot file metadata when mounted, but read file bytes live.
 - Higher priority wins. Equal priority breaks in favor of the later mount.
+- `vmount --unmount <mount-number>` removes a mount spec by its 1-based command order for that one CLI invocation.
 - Exact-path overlays are allowed. Parent-directory conflicts are rejected.
 - For encrypted archives, provide `--key <pass>` in CLI, or enter the password in the browser after mounting.
