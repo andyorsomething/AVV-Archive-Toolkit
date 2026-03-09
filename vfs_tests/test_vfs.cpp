@@ -13,6 +13,7 @@
  */
 #define CATCH_CONFIG_MAIN
 #include "../vfs_core/archive_reader.h"
+#include "../vfs_core/mounted_file_system.h"
 #include "../vfs_core/archive_writer.h"
 #include "catch2/catch.hpp"
 #include <filesystem>
@@ -1052,4 +1053,226 @@ TEST_CASE("Async I/O - Concurrent Reads", "[vfs_core][async]") {
 
   std::filesystem::remove_all(test_dir);
   std::filesystem::remove(archive);
+}
+
+TEST_CASE("Mounted FS - Archive and Host Directory", "[vfs_core][mount]") {
+  const std::filesystem::path archive_in = "mount_archive_in";
+  const std::filesystem::path host_in = "mount_host_in";
+  const std::filesystem::path archive = "mount_archive.avv";
+
+  std::filesystem::remove_all(archive_in);
+  std::filesystem::remove_all(host_in);
+  std::filesystem::remove(archive);
+  std::filesystem::create_directories(archive_in / "config");
+  std::filesystem::create_directories(host_in / "mods");
+
+  write_file(archive_in / "config" / "base.txt", "base");
+  write_file(host_in / "mods" / "override.txt", "override");
+
+  {
+    ArchiveWriter writer;
+    REQUIRE(writer.pack_directory(archive_in, archive).has_value());
+  }
+
+  {
+    MountedFileSystem fs;
+    REQUIRE(fs.mount_archive(archive).has_value());
+    REQUIRE(fs.mount_host_directory(
+                host_in, {"/", 100, PathCasePolicy::HostNative, ""})
+                .has_value());
+
+    auto archive_read = fs.read_file_data("/config/base.txt");
+    REQUIRE(archive_read.has_value());
+    CHECK(std::string(archive_read.value().begin(), archive_read.value().end()) ==
+          "base");
+
+    auto host_read = fs.read_file_data("/mods/override.txt");
+    REQUIRE(host_read.has_value());
+    CHECK(std::string(host_read.value().begin(), host_read.value().end()) ==
+          "override");
+
+    auto list_res = fs.list_directory("/");
+    REQUIRE(list_res.has_value());
+    REQUIRE(list_res.value().size() == 2);
+    fs.unmount_all();
+  }
+
+  std::filesystem::remove_all(archive_in);
+  std::filesystem::remove_all(host_in);
+  std::filesystem::remove(archive);
+}
+
+TEST_CASE("Mounted FS - Overlay Priority", "[vfs_core][mount]") {
+  const std::filesystem::path a_dir = "mount_overlay_a";
+  const std::filesystem::path b_dir = "mount_overlay_b";
+  const std::filesystem::path a_archive = "overlay_a.avv";
+  const std::filesystem::path b_archive = "overlay_b.avv";
+
+  std::filesystem::remove_all(a_dir);
+  std::filesystem::remove_all(b_dir);
+  std::filesystem::remove(a_archive);
+  std::filesystem::remove(b_archive);
+  std::filesystem::create_directories(a_dir);
+  std::filesystem::create_directories(b_dir);
+
+  write_file(a_dir / "same.txt", "base");
+  write_file(b_dir / "same.txt", "patch");
+
+  {
+    ArchiveWriter writer;
+    REQUIRE(writer.pack_directory(a_dir, a_archive).has_value());
+    REQUIRE(writer.pack_directory(b_dir, b_archive).has_value());
+  }
+
+  {
+    MountedFileSystem fs;
+    REQUIRE(fs.mount_archive(
+                a_archive, {"/", 0, PathCasePolicy::ArchiveExact, ""})
+                .has_value());
+    REQUIRE(fs.mount_archive(
+                b_archive, {"/", 10, PathCasePolicy::ArchiveExact, ""})
+                .has_value());
+
+    auto data = fs.read_file_data("/same.txt");
+    REQUIRE(data.has_value());
+    CHECK(std::string(data.value().begin(), data.value().end()) == "patch");
+
+    auto overlays = fs.list_overlays("/same.txt");
+    REQUIRE(overlays.has_value());
+    REQUIRE(overlays.value().size() == 2);
+    CHECK(overlays.value()[0].priority == 10);
+    fs.unmount_all();
+  }
+
+  std::filesystem::remove_all(a_dir);
+  std::filesystem::remove_all(b_dir);
+  std::filesystem::remove(a_archive);
+  std::filesystem::remove(b_archive);
+}
+
+TEST_CASE("Mounted FS - Parent Conflict", "[vfs_core][mount]") {
+  const std::filesystem::path file_dir = "mount_conflict_file";
+  const std::filesystem::path tree_dir = "mount_conflict_tree";
+  const std::filesystem::path file_archive = "mount_conflict_file.avv";
+  const std::filesystem::path tree_archive = "mount_conflict_tree.avv";
+
+  std::filesystem::remove_all(file_dir);
+  std::filesystem::remove_all(tree_dir);
+  std::filesystem::remove(file_archive);
+  std::filesystem::remove(tree_archive);
+  std::filesystem::create_directories(file_dir);
+  std::filesystem::create_directories(tree_dir / "config");
+
+  write_file(file_dir / "config", "flat");
+  write_file(tree_dir / "config" / "settings.json", "{}");
+
+  ArchiveWriter writer;
+  REQUIRE(writer.pack_directory(file_dir, file_archive).has_value());
+  REQUIRE(writer.pack_directory(tree_dir, tree_archive).has_value());
+
+  MountedFileSystem fs;
+  REQUIRE(fs.mount_archive(file_archive).has_value());
+  auto res = fs.mount_archive(tree_archive);
+  REQUIRE_FALSE(res.has_value());
+  CHECK(res.error() == ErrorCode::PathConflict);
+
+  std::filesystem::remove_all(file_dir);
+  std::filesystem::remove_all(tree_dir);
+  std::filesystem::remove(file_archive);
+  std::filesystem::remove(tree_archive);
+}
+
+TEST_CASE("Mounted FS - Host Directory Content Live, Metadata Snapshotted",
+          "[vfs_core][mount]") {
+  const std::filesystem::path host_dir = "mount_live_host";
+  std::filesystem::remove_all(host_dir);
+  std::filesystem::create_directories(host_dir);
+  write_file(host_dir / "live.txt", "old");
+
+  MountedFileSystem fs;
+  REQUIRE(fs.mount_host_directory(host_dir).has_value());
+
+  auto before = fs.stat("/live.txt");
+  REQUIRE(before.has_value());
+  CHECK(before.value().size == 3);
+
+  write_file(host_dir / "live.txt", "new-content");
+  auto read = fs.read_file_data("/live.txt");
+  REQUIRE(read.has_value());
+  CHECK(std::string(read.value().begin(), read.value().end()) == "new-content");
+
+  auto after = fs.stat("/live.txt");
+  REQUIRE(after.has_value());
+  CHECK(after.value().size == 3);
+
+  std::filesystem::remove_all(host_dir);
+}
+
+TEST_CASE("Mounted FS - HostNative Lookup Is Case Insensitive On Windows",
+          "[vfs_core][mount]") {
+  const std::filesystem::path host_dir = "mount_case_host";
+  std::filesystem::remove_all(host_dir);
+  std::filesystem::create_directories(host_dir);
+  write_file(host_dir / "CaseFile.txt", "mixed");
+
+  MountedFileSystem fs;
+  REQUIRE(fs.mount_host_directory(host_dir).has_value());
+
+#ifdef _WIN32
+  auto res = fs.read_file_data("/casefile.txt");
+  REQUIRE(res.has_value());
+  CHECK(std::string(res.value().begin(), res.value().end()) == "mixed");
+#else
+  auto res = fs.read_file_data("/casefile.txt");
+  REQUIRE_FALSE(res.has_value());
+#endif
+
+  std::filesystem::remove_all(host_dir);
+}
+
+TEST_CASE("Mounted FS - list_directory Rejects File Paths", "[vfs_core][mount]") {
+  const std::filesystem::path host_dir = "mount_list_file";
+  std::filesystem::remove_all(host_dir);
+  std::filesystem::create_directories(host_dir);
+  write_file(host_dir / "file.txt", "value");
+
+  MountedFileSystem fs;
+  REQUIRE(fs.mount_host_directory(host_dir).has_value());
+  auto list_res = fs.list_directory("/file.txt");
+  REQUIRE_FALSE(list_res.has_value());
+  CHECK(list_res.error() == ErrorCode::NotADirectory);
+
+  std::filesystem::remove_all(host_dir);
+}
+
+TEST_CASE("Mounted FS - Host Async Callback Survives Unmount",
+          "[vfs_core][mount][async]") {
+  const std::filesystem::path host_dir = "mount_async_host";
+  std::filesystem::remove_all(host_dir);
+  std::filesystem::create_directories(host_dir);
+  write_file(host_dir / "async.txt", "async");
+
+  MountedFileSystem fs;
+  auto mount_res = fs.mount_host_directory(host_dir);
+  REQUIRE(mount_res.has_value());
+
+  std::atomic<bool> callback_called{false};
+  std::atomic<bool> callback_ok{false};
+  fs.read_file_async("/async.txt", [&](Result<std::vector<char>> res) {
+    callback_called.store(true);
+    callback_ok.store(res.has_value());
+  });
+  REQUIRE(fs.unmount(mount_res.value()).has_value());
+
+  auto start_time = std::chrono::steady_clock::now();
+  while (!callback_called.load() &&
+         std::chrono::steady_clock::now() - start_time <
+             std::chrono::seconds(2)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  REQUIRE(callback_called.load());
+  CHECK(callback_ok.load());
+
+  std::filesystem::remove_all(host_dir);
 }

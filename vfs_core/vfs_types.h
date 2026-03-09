@@ -31,8 +31,13 @@ enum class ErrorCode {
   ArchiveTooLarge,  ///< The requested archive exceeds a format size limit.
   HashMismatch,     ///< The archive's computed integrity hash does not match
                     ///< the stored hash.
-  DecryptionFailed  ///< The file payload could not be decrypted (e.g., wrong
+  DecryptionFailed, ///< The file payload could not be decrypted (e.g., wrong
                     ///< password).
+  AlreadyMounted,   ///< The requested mount already exists.
+  MountNotFound,    ///< The requested mount id could not be found.
+  PathConflict,     ///< The requested mount would create an ambiguous path.
+  InvalidMountPoint, ///< The requested mount point is invalid.
+  NotADirectory      ///< The requested path is not a directory.
 };
 
 /**
@@ -60,6 +65,16 @@ inline const char *error_code_to_string(ErrorCode code) {
     return "Hash Mismatch (Integrity Error)";
   case ErrorCode::DecryptionFailed:
     return "Decryption Failed";
+  case ErrorCode::AlreadyMounted:
+    return "Already Mounted";
+  case ErrorCode::MountNotFound:
+    return "Mount Not Found";
+  case ErrorCode::PathConflict:
+    return "Path Conflict";
+  case ErrorCode::InvalidMountPoint:
+    return "Invalid Mount Point";
+  case ErrorCode::NotADirectory:
+    return "Not A Directory";
   default:
     return "Unknown Error";
   }

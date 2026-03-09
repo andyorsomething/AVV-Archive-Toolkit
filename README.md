@@ -17,6 +17,7 @@ AVV-Archive-Toolkit/
 
 - **[VFS CLI Guide](CLI_MANUAL.md)** - Guide for packing and unpacking archives with `vfs_cli`.
 - **[Virtual File Browser GUI Guide](VFB_MANUAL.md)** - Guide for exploring, extracting, and appending archives with `vfs_browser`.
+- **[Mounted File System Implementation Artifact](MOUNTED_FILESYSTEM_IMPLEMENTATION_ARTIFACT.md)** - Design and implementation notes for mounted archive and host-directory namespaces.
 
 ## Quick Start
 
@@ -98,6 +99,27 @@ reader.unpack_all("output/", [](uint32_t cur, uint32_t tot, const std::string &p
     printf("  %u/%u %s\n", cur, tot, path.c_str());
 });
 ```
+
+### Mounted namespace
+
+```cpp
+#include "vfs_core/mounted_file_system.h"
+
+vfs::MountedFileSystem fs;
+
+fs.mount_archive("base_dir.avv", {"/game", 0, vfs::PathCasePolicy::ArchiveExact});
+fs.mount_archive("patch_dir.avv", {"/game", 100, vfs::PathCasePolicy::ArchiveExact});
+fs.mount_host_directory("C:/mods/live_override",
+                        {"/game", 200, vfs::PathCasePolicy::HostNative});
+
+auto data = fs.read_file_data("/game/config/settings.json");
+auto stat = fs.stat("/game/config/settings.json");
+auto list = fs.list_directory("/game/config");
+```
+
+Mounted namespaces are read-only in this phase. Archive mounts are indexed from
+AVV metadata; host-directory mounts snapshot file metadata at mount time but
+read live file bytes on demand.
 
 ### Writing an archive
 

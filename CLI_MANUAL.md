@@ -9,6 +9,11 @@ vfs_cli [-v] [-c <1..12>] [--encrypt <xor|aes>] [--key <pass>] [--no-journal] pa
 vfs_cli [-v] [-c <1..12>] [--encrypt <xor|aes>] [--key <pass>] [-s <GB>] [--no-journal] packs <stem> <input_dir>
 vfs_cli [-v] [--key <pass>] unpack <input.avv|_dir.avv> <output_dir>
 vfs_cli list <input.avv|_dir.avv>
+vfs_cli vmount list <virtual_dir> <mount_spec>...
+vfs_cli vmount cat <virtual_path> <mount_spec>...
+vfs_cli vmount extract <virtual_path> <output_path> <mount_spec>...
+vfs_cli vmount stat <virtual_path> <mount_spec>...
+vfs_cli vmount overlays <virtual_path> <mount_spec>...
 ```
 
 ## Commands
@@ -19,6 +24,7 @@ vfs_cli list <input.avv|_dir.avv>
 | `packs` | Pack a directory into a split AVV5 archive set |
 | `unpack` | Extract all files from an archive |
 | `list` | Print the central directory without extracting |
+| `vmount ...` | Inspect a merged mounted namespace built from archives and/or host directories |
 
 ## Flags
 
@@ -30,6 +36,49 @@ vfs_cli list <input.avv|_dir.avv>
 | `--encrypt <alg>` | `none` | Encryption algorithm: `xor` or `aes` |
 | `--key <pass>` | empty | Password for encryption or decryption |
 | `--no-journal` | off | Disable resume journaling during packing |
+
+## Mounted Namespace
+
+Mounted CLI commands build an in-memory read-only namespace from one or more
+sources.
+
+Mount specs:
+
+```text
+--archive <path> [--at <mount>] [--priority <n>] [--key <pass>] [--case <archive|host|sensitive|insensitive>]
+--dir <path>     [--at <mount>] [--priority <n>] [--case <archive|host|sensitive|insensitive>]
+```
+
+Defaults:
+
+- archive mounts default to mount point `/`, priority `0`, case policy `archive`
+- host-directory mounts default to mount point `/`, priority `0`, case policy `host`
+- higher priority wins; equal priority breaks in favor of the later mount
+
+Examples:
+
+```powershell
+.\vfs_cli.exe vmount list /game `
+  --archive base_dir.avv --at /game --priority 0 `
+  --archive patch_dir.avv --at /game --priority 100 `
+  --dir C:\mods\live --at /game --priority 200
+
+.\vfs_cli.exe vmount cat /game/config/settings.json `
+  --archive base_dir.avv --at /game `
+  --archive patch_dir.avv --at /game --priority 100
+
+.\vfs_cli.exe vmount stat /game/config/settings.json `
+  --archive base_dir.avv --at /game `
+  --dir C:\mods\live --at /game --priority 200
+```
+
+Mounted mode is read-only in this phase. It supports:
+
+- merged directory listing
+- file reads to stdout
+- extraction to disk
+- stat-style source inspection
+- overlay inspection for conflicting exact paths
 
 ## Examples
 

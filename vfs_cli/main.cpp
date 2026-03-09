@@ -1,26 +1,20 @@
 /**
  * @file main.cpp
- * @brief VFS CLI — pack, packs (split), unpack, list, with progress bars.
- *
- * Flags:
- *   -v           Verbose per-file output.
- *   -s <GB>      Chunk size in GiB for split packing (default 12).
- *   -c <level>   LZ4 compression level 1..12 (default 3).
+ * @brief VFS CLI - pack, packs, unpack, list, and mounted namespace inspection.
  */
 #include "../vfs_core/archive_reader.h"
 #include "../vfs_core/archive_writer.h"
+#include "../vfs_core/mounted_file_system.h"
 #include <charconv>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <vector>
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+namespace {
 
-/// @brief Formats a byte count into a human-readable string (e.g. "1.2 MB").
 static std::string format_size(uint64_t bytes) {
   char buf[32];
   if (bytes >= 1024ULL * 1024 * 1024)
@@ -35,47 +29,42 @@ static std::string format_size(uint64_t bytes) {
   return buf;
 }
 
-/// @brief Prints full CLI usage, commands, flags, and drag-and-drop info.
 static void print_usage(const char *prog) {
   std::cout << "Usage:\n"
             << "  " << prog
-            << " [-v] [-c <1..12>] pack  <output.avv> <input_dir>\n"
+            << " [-v] [-c <1..12>] [--encrypt <xor|aes>] [--key <pass>] "
+               "[--no-journal] pack <output.avv> <input_dir>\n"
             << "  " << prog
-            << " [-v] [-c <1..12>] [-s <GB>] packs <stem> <input_dir>\n"
+            << " [-v] [-c <1..12>] [-s <GB>] [--encrypt <xor|aes>] [--key "
+               "<pass>] [--no-journal] packs <stem> <input_dir>\n"
             << "  " << prog
-            << " [-v] unpack <input.avv|_dir.avv> <output_dir>\n"
+            << " [-v] [--key <pass>] unpack <input.avv|_dir.avv> <output_dir>\n"
             << "  " << prog << " list <input.avv|_dir.avv>\n"
-            << "\nOptions:\n"
-            << "  -v          Verbose: print each file.\n"
-            << "  -c <level>  LZ4 compression level (default 3; range 1-12).\n"
-            << "  -s <GB>     Chunk size for split archives (default 12).\n"
-            << "  --encrypt <alg>  Algorithm to use: xor, aes\n"
-            << "  --key <pass>     Password for encryption / decryption\n"
-            << "  --no-journal     Disable resume journaling\n"
-            << "\nDrag-and-drop:\n"
-            << "  Folder → split-pack at 12 GiB chunks.\n"
-            << "  .avv   → unpack beside the archive.\n";
+            << "  " << prog << " vmount list <virtual_dir> <mount_spec>...\n"
+            << "  " << prog << " vmount cat <virtual_path> <mount_spec>...\n"
+            << "  " << prog
+            << " vmount extract <virtual_path> <output_path> <mount_spec>...\n"
+            << "  " << prog << " vmount stat <virtual_path> <mount_spec>...\n"
+            << "  " << prog
+            << " vmount overlays <virtual_path> <mount_spec>...\n"
+            << "\nMount specs:\n"
+            << "  --archive <path> [--at <mount>] [--priority <n>] [--key "
+               "<pass>] [--case <archive|host|sensitive|insensitive>]\n"
+            << "  --dir <path>     [--at <mount>] [--priority <n>] [--case "
+               "<archive|host|sensitive|insensitive>]\n";
 }
 
-// ---------------------------------------------------------------------------
-// Progress bar renderer (inline, \r based)
-// ---------------------------------------------------------------------------
-
-/// @brief Renders: [████████░░░░░░░░░░░░]  42%  (128/305)  filename.ext
 static void render_progress(uint32_t current, uint32_t total,
                             const std::string &path) {
-  constexpr int BAR_WIDTH = 20;
+  constexpr int kBarWidth = 20;
   const float fraction =
       (total > 0) ? static_cast<float>(current) / total : 1.0f;
-  const int filled = static_cast<int>(fraction * BAR_WIDTH);
-
-  // Build bar string: filled = '#', empty = '-'     (ASCII-safe)
-  char bar[BAR_WIDTH + 1];
-  for (int i = 0; i < BAR_WIDTH; ++i)
+  const int filled = static_cast<int>(fraction * kBarWidth);
+  char bar[kBarWidth + 1];
+  for (int i = 0; i < kBarWidth; ++i)
     bar[i] = (i < filled) ? '#' : '-';
-  bar[BAR_WIDTH] = '\0';
+  bar[kBarWidth] = '\0';
 
-  // Truncate filename to last 30 chars
   std::string short_path = path;
   if (short_path.size() > 30)
     short_path = "..." + short_path.substr(short_path.size() - 27);
@@ -84,13 +73,10 @@ static void render_progress(uint32_t current, uint32_t total,
               static_cast<int>(fraction * 100.0f), current, total,
               short_path.c_str());
   std::fflush(stdout);
-
   if (current == total)
     std::printf("\n");
 }
 
-/// @brief Verbose listing: prints each entry's chunk, path, size, and
-/// compression.
 static void print_entries(const vfs::ArchiveReader &reader, const char *verb) {
   for (const auto &e : reader.get_entries()) {
     const char *comp = vfs::cde_is_lz4(e.flags) ? "LZ4" : "Raw";
@@ -99,17 +85,6 @@ static void print_entries(const vfs::ArchiveReader &reader, const char *verb) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Flag parsing helper
-// ---------------------------------------------------------------------------
-
-/// @brief Parses a numeric CLI argument following a flag (e.g. "-s 12").
-/// @param name       Flag name (for error messages).
-/// @param arg_offset Current argv index; advanced past the value on success.
-/// @param argc       Total argument count.
-/// @param argv       Argument array.
-/// @param[out] out   Parsed value.
-/// @return true on success, false on parse error.
 static bool parse_uint_arg(const char *name, int &arg_offset, int argc,
                            char **argv, unsigned long long &out) {
   if (arg_offset + 1 >= argc) {
@@ -129,9 +104,257 @@ static bool parse_uint_arg(const char *name, int &arg_offset, int argc,
   return true;
 }
 
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
+struct MountSpec {
+  vfs::MountedFileSystem::MountSourceKind kind;
+  std::filesystem::path path;
+  vfs::MountedFileSystem::MountOptions options;
+};
+
+static bool parse_int_arg(const char *name, const std::string &value, int &out) {
+  const char *begin = value.data();
+  const char *end = begin + value.size();
+  auto [ptr, ec] = std::from_chars(begin, end, out);
+  if (ec != std::errc{} || ptr != end) {
+    std::cerr << "Error: invalid " << name << " value '" << value << "'.\n";
+    return false;
+  }
+  return true;
+}
+
+static bool parse_case_policy(const std::string &policy,
+                              vfs::PathCasePolicy &out) {
+  if (policy == "archive")
+    out = vfs::PathCasePolicy::ArchiveExact;
+  if (policy == "host")
+    out = vfs::PathCasePolicy::HostNative;
+  if (policy == "sensitive")
+    out = vfs::PathCasePolicy::ForceSensitive;
+  if (policy == "insensitive")
+    out = vfs::PathCasePolicy::ForceInsensitive;
+  if (policy == "archive" || policy == "host" || policy == "sensitive" ||
+      policy == "insensitive")
+    return true;
+  std::cerr << "Error: invalid --case policy '" << policy << "'.\n";
+  return false;
+}
+
+static bool parse_mount_specs(int start, int argc, char **argv,
+                              std::vector<MountSpec> &specs) {
+  int i = start;
+  while (i < argc) {
+    const std::string arg = argv[i];
+    if (arg != "--archive" && arg != "--dir") {
+      std::cerr << "Error: expected '--archive' or '--dir', got '" << arg
+                << "'.\n";
+      return false;
+    }
+    if (i + 1 >= argc) {
+      std::cerr << "Error: mount source path missing.\n";
+      return false;
+    }
+
+    MountSpec spec;
+    spec.kind = (arg == "--archive")
+                    ? vfs::MountedFileSystem::MountSourceKind::Archive
+                    : vfs::MountedFileSystem::MountSourceKind::HostDirectory;
+    spec.path = argv[++i];
+    spec.options.mount_point = "/";
+    spec.options.priority = 0;
+    spec.options.case_policy =
+        (spec.kind == vfs::MountedFileSystem::MountSourceKind::Archive)
+            ? vfs::PathCasePolicy::ArchiveExact
+            : vfs::PathCasePolicy::HostNative;
+
+    ++i;
+    while (i < argc) {
+      const std::string opt = argv[i];
+      if (opt == "--archive" || opt == "--dir")
+        break;
+      if (opt == "--at") {
+        if (i + 1 >= argc) {
+          std::cerr << "Error: --at requires a mount point.\n";
+          return false;
+        }
+        spec.options.mount_point = argv[i + 1];
+        i += 2;
+      } else if (opt == "--priority") {
+        if (i + 1 >= argc) {
+          std::cerr << "Error: --priority requires a value.\n";
+          return false;
+        }
+        if (!parse_int_arg("--priority", argv[i + 1], spec.options.priority))
+          return false;
+        i += 2;
+      } else if (opt == "--key") {
+        if (i + 1 >= argc) {
+          std::cerr << "Error: --key requires a password.\n";
+          return false;
+        }
+        spec.options.password = argv[i + 1];
+        i += 2;
+      } else if (opt == "--case") {
+        if (i + 1 >= argc) {
+          std::cerr << "Error: --case requires a policy.\n";
+          return false;
+        }
+        if (!parse_case_policy(argv[i + 1], spec.options.case_policy))
+          return false;
+        i += 2;
+      } else {
+        std::cerr << "Error: unknown mount option '" << opt << "'.\n";
+        return false;
+      }
+    }
+    specs.push_back(std::move(spec));
+  }
+  return !specs.empty();
+}
+
+static bool mount_all(vfs::MountedFileSystem &fs,
+                      const std::vector<MountSpec> &specs) {
+  for (const auto &spec : specs) {
+    vfs::Result<uint32_t> res =
+        (spec.kind == vfs::MountedFileSystem::MountSourceKind::Archive)
+            ? fs.mount_archive(spec.path, spec.options)
+            : fs.mount_host_directory(spec.path, spec.options);
+    if (!res) {
+      std::cerr << "Error: " << vfs::error_code_to_string(res.error()) << "\n";
+      return false;
+    }
+  }
+  return true;
+}
+
+static int handle_vmount(int argc, char **argv, int arg_offset) {
+  if (arg_offset + 1 >= argc) {
+    print_usage(argv[0]);
+    return 1;
+  }
+
+  const std::string action = argv[arg_offset + 1];
+  vfs::MountedFileSystem fs;
+  std::vector<MountSpec> specs;
+
+  if (action == "list") {
+    if (arg_offset + 2 >= argc) {
+      print_usage(argv[0]);
+      return 1;
+    }
+    if (!parse_mount_specs(arg_offset + 3, argc, argv, specs))
+      return 1;
+    if (!mount_all(fs, specs))
+      return 1;
+    auto list_res = fs.list_directory(argv[arg_offset + 2]);
+    if (!list_res) {
+      std::cerr << "Error: " << vfs::error_code_to_string(list_res.error())
+                << "\n";
+      return 1;
+    }
+    for (const auto &entry : list_res.value()) {
+      std::printf("%c %-40s %10s %s\n", entry.is_directory ? 'D' : 'F',
+                  entry.virtual_path.c_str(), format_size(entry.size).c_str(),
+                  entry.is_directory ? "<dir>" : entry.source_path.c_str());
+    }
+    return 0;
+  }
+
+  if (action == "cat") {
+    if (arg_offset + 2 >= argc) {
+      print_usage(argv[0]);
+      return 1;
+    }
+    if (!parse_mount_specs(arg_offset + 3, argc, argv, specs))
+      return 1;
+    if (!mount_all(fs, specs))
+      return 1;
+    auto read_res = fs.read_file_data(argv[arg_offset + 2]);
+    if (!read_res) {
+      std::cerr << "Error: " << vfs::error_code_to_string(read_res.error())
+                << "\n";
+      return 1;
+    }
+    if (!read_res.value().empty())
+      std::cout.write(read_res.value().data(),
+                      static_cast<std::streamsize>(read_res.value().size()));
+    return 0;
+  }
+
+  if (action == "extract") {
+    if (arg_offset + 3 >= argc) {
+      print_usage(argv[0]);
+      return 1;
+    }
+    if (!parse_mount_specs(arg_offset + 4, argc, argv, specs))
+      return 1;
+    if (!mount_all(fs, specs))
+      return 1;
+    auto res = fs.extract_file(argv[arg_offset + 2], argv[arg_offset + 3]);
+    if (!res) {
+      std::cerr << "Error: " << vfs::error_code_to_string(res.error()) << "\n";
+      return 1;
+    }
+    return 0;
+  }
+
+  if (action == "stat") {
+    if (arg_offset + 2 >= argc) {
+      print_usage(argv[0]);
+      return 1;
+    }
+    if (!parse_mount_specs(arg_offset + 3, argc, argv, specs))
+      return 1;
+    if (!mount_all(fs, specs))
+      return 1;
+    auto stat_res = fs.stat(argv[arg_offset + 2]);
+    if (!stat_res) {
+      std::cerr << "Error: " << vfs::error_code_to_string(stat_res.error())
+                << "\n";
+      return 1;
+    }
+    const auto &entry = stat_res.value();
+    std::cout << "Virtual:  " << entry.virtual_path << "\n"
+              << "Type:     "
+              << (entry.is_directory
+                      ? "Directory"
+                      : (entry.source_kind ==
+                                 vfs::MountedFileSystem::MountSourceKind::Archive
+                             ? "Archive File"
+                             : "Host File"))
+              << "\n"
+              << "Source:   " << entry.source_root << "\n"
+              << "Path:     " << entry.source_path << "\n"
+              << "Priority: " << entry.priority << "\n"
+              << "Size:     " << format_size(entry.size) << "\n";
+    return 0;
+  }
+
+  if (action == "overlays") {
+    if (arg_offset + 2 >= argc) {
+      print_usage(argv[0]);
+      return 1;
+    }
+    if (!parse_mount_specs(arg_offset + 3, argc, argv, specs))
+      return 1;
+    if (!mount_all(fs, specs))
+      return 1;
+    auto overlays_res = fs.list_overlays(argv[arg_offset + 2]);
+    if (!overlays_res) {
+      std::cerr << "Error: "
+                << vfs::error_code_to_string(overlays_res.error()) << "\n";
+      return 1;
+    }
+    for (const auto &entry : overlays_res.value()) {
+      std::printf("%4d  %-40s  %s\n", entry.priority, entry.virtual_path.c_str(),
+                  entry.source_root.string().c_str());
+    }
+    return 0;
+  }
+
+  std::cerr << "Unknown vmount action: " << action << "\n";
+  return 1;
+}
+
+} // namespace
 
 int main(int argc, char **argv) {
   bool verbose = false;
@@ -165,7 +388,7 @@ int main(int argc, char **argv) {
         std::cerr << "Error: --encrypt requires 'xor' or 'aes'.\n";
         return 1;
       }
-      std::string alg = argv[++arg_offset];
+      const std::string alg = argv[++arg_offset];
       if (alg == "xor")
         enc_opts.algorithm = vfs::EncryptionAlgorithm::Xor;
       else if (alg == "aes")
@@ -185,8 +408,9 @@ int main(int argc, char **argv) {
     } else if (a == "--no-journal") {
       enable_journal = false;
       ++arg_offset;
-    } else
+    } else {
       break;
+    }
   }
 
   const uint64_t chunk_bytes = chunk_gb * 1024ULL * 1024 * 1024;
@@ -196,48 +420,31 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  // -- Drag-and-drop -------------------------------------------------------
   auto is_cmd = [](const std::string &s) {
-    return s == "pack" || s == "packs" || s == "unpack" || s == "list";
+    return s == "pack" || s == "packs" || s == "unpack" || s == "list" ||
+           s == "vmount";
   };
 
   const std::string first_arg = argv[arg_offset];
   const std::filesystem::path dropped(first_arg);
-
   if (!is_cmd(first_arg) && std::filesystem::exists(dropped)) {
     int rc = 0;
-
     if (std::filesystem::is_directory(dropped)) {
       const std::string stem =
           (dropped.parent_path() / dropped.filename()).string();
-      std::cout << "Drag-and-drop: split-packing " << dropped << "\n"
-                << "            => " << stem
-                << "_dir.avv  (chunks: " << chunk_gb << " GiB, level "
-                << comp_level << ")\n\n";
-
-       vfs::ArchiveWriter writer;
-       auto r = writer.pack_directory_split(
-           dropped, stem, chunk_bytes, comp_level, render_progress, enc_opts,
-           enable_journal);
+      vfs::ArchiveWriter writer;
+      auto r = writer.pack_directory_split(dropped, stem, chunk_bytes,
+                                           comp_level, render_progress, enc_opts,
+                                           enable_journal);
       if (!r) {
         std::cerr << "Error: " << vfs::error_code_to_string(r.error()) << "\n";
         rc = 1;
-      } else {
-        std::cout << "\nDone: " << stem << "_dir.avv\n";
       }
-
     } else if (dropped.extension() == ".avv") {
-      const std::string fname = dropped.filename().string();
-      std::string stem = fname;
-      if (stem.size() > 8 && stem.substr(stem.size() - 8) == "_dir.avv")
-        stem = stem.substr(0, stem.size() - 8);
-      else if (stem.size() > 4 && stem.substr(stem.size() - 4) == ".avv")
+      std::string stem = dropped.stem().string();
+      if (stem.size() > 4 && stem.substr(stem.size() - 4) == "_dir")
         stem = stem.substr(0, stem.size() - 4);
-
       const auto out_dir = dropped.parent_path() / stem;
-      std::cout << "Drag-and-drop: unpacking " << dropped << "\n"
-                << "            => " << out_dir << "/\n\n";
-
       vfs::ArchiveReader reader;
       auto r = reader.open(dropped);
       if (!r) {
@@ -249,22 +456,20 @@ int main(int argc, char **argv) {
           std::cerr << "Error: " << vfs::error_code_to_string(r.error())
                     << "\n";
           rc = 1;
-        } else {
-          std::cout << "\nDone: " << out_dir << "\n";
         }
       }
     } else {
       std::cerr << "Error: not a directory or .avv file.\n";
       rc = 1;
     }
-
     std::cout << "\nPress Enter to close...\n";
     std::cin.get();
     return rc;
   }
 
-  // -- Explicit commands ---------------------------------------------------
   const std::string command = first_arg;
+  if (command == "vmount")
+    return handle_vmount(argc, argv, arg_offset);
 
   if (command == "list") {
     if (arg_offset + 1 >= argc) {
@@ -277,23 +482,18 @@ int main(int argc, char **argv) {
       std::cerr << "Error: " << vfs::error_code_to_string(r.error()) << "\n";
       return 1;
     }
-
     const auto &entries = reader.get_entries();
     std::cout << "Archive: " << argv[arg_offset + 1] << "  (" << entries.size()
               << " files)\n";
-    std::cout << "-------------------------------------------------------------"
-                 "--------\n";
     uint64_t ts = 0, td = 0;
     for (const auto &e : entries) {
-      const char *c = vfs::cde_is_lz4(e.flags) ? "LZ4" : "Raw";
       std::printf("  [%03u] %-40s %10s %10s  %s\n", e.chunk_index,
                   e.path.c_str(), format_size(e.size).c_str(),
-                  format_size(e.compressed_size).c_str(), c);
+                  format_size(e.compressed_size).c_str(),
+                  vfs::cde_is_lz4(e.flags) ? "LZ4" : "Raw");
       ts += e.size;
       td += e.compressed_size;
     }
-    std::cout << "-------------------------------------------------------------"
-                 "--------\n";
     std::printf("  Total: %s uncompressed, %s on disk\n",
                 format_size(ts).c_str(), format_size(td).c_str());
     return 0;
@@ -327,16 +527,17 @@ int main(int argc, char **argv) {
       return 1;
     }
     vfs::ArchiveWriter writer;
-    auto r = writer.pack_directory_split(
-        argv[arg_offset + 2], argv[arg_offset + 1], chunk_bytes, comp_level,
-        render_progress, enc_opts, enable_journal);
+    auto r = writer.pack_directory_split(argv[arg_offset + 2], argv[arg_offset + 1],
+                                         chunk_bytes, comp_level,
+                                         render_progress, enc_opts,
+                                         enable_journal);
     if (!r) {
       std::cerr << "Error: " << vfs::error_code_to_string(r.error()) << "\n";
       return 1;
     }
     if (verbose) {
       vfs::ArchiveReader rd;
-      std::string dir = std::string(argv[arg_offset + 1]) + "_dir.avv";
+      const std::string dir = std::string(argv[arg_offset + 1]) + "_dir.avv";
       if (rd.open(dir))
         print_entries(rd, "packed");
     }

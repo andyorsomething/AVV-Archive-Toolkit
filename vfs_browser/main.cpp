@@ -4,6 +4,7 @@
 // ============================================================
 #include "../vfs_core/archive_reader.h"
 #include "../vfs_core/archive_writer.h"
+#include "../vfs_core/mounted_file_system.h"
 #include "backends/imgui_impl_opengl3.h"
 #include "backends/imgui_impl_sdl2.h"
 #include "imgui.h"
@@ -159,6 +160,19 @@ struct DirectoryNode {
   DirectoryNode *parent = nullptr; ///< Pointer to parent node (null for root).
 };
 
+enum class BrowserMode {
+  SingleArchive,
+  MountedNamespace
+};
+
+struct BrowserMountInfo {
+  vfs::MountedFileSystem::MountSourceKind kind;
+  std::filesystem::path source_root;
+  std::string mount_point;
+  int priority = 0;
+  vfs::PathCasePolicy case_policy = vfs::PathCasePolicy::ArchiveExact;
+};
+
 /**
  * @struct AppState
  * @brief Central application state shared across all VFB UI panels.
@@ -166,6 +180,9 @@ struct DirectoryNode {
 struct AppState {
   std::shared_ptr<vfs::ArchiveReader> reader =
       std::make_shared<vfs::ArchiveReader>();
+  std::shared_ptr<vfs::MountedFileSystem> mounted_fs =
+      std::make_shared<vfs::MountedFileSystem>();
+  BrowserMode mode = BrowserMode::SingleArchive;
 
   bool archive_open = false;
   bool archive_encrypted = false;
@@ -174,6 +191,7 @@ struct AppState {
   std::string archive_path_str;
 
   std::optional<vfs::ArchiveReader::FileEntry> selected_entry;
+  std::optional<vfs::MountedFileSystem::MountedEntry> selected_mounted_entry;
   std::vector<char> preview_data;
   std::string drag_out_pending;
   std::filesystem::path drag_out_temp_path;
@@ -192,6 +210,8 @@ struct AppState {
 
   std::unique_ptr<DirectoryNode> root_dir;
   DirectoryNode *current_dir = nullptr;
+  std::string current_mount_dir = "/";
+  std::vector<BrowserMountInfo> mounts;
 
   // ---- Extraction progress state ----
   std::atomic<bool> extracting{false};
@@ -202,9 +222,34 @@ struct AppState {
   std::thread extract_thread;
   std::atomic<bool> extract_succeeded{false};
 
+  [[nodiscard]] bool has_open_content() const {
+    return archive_open ||
+           (mode == BrowserMode::MountedNamespace && mounted_fs &&
+            mounted_fs->is_mounted());
+  }
+
+  void clear_selection() {
+    selected_entry.reset();
+    selected_mounted_entry.reset();
+    preview_data.clear();
+    if (preview_texture) {
+      glDeleteTextures(1, &preview_texture);
+      preview_texture = 0;
+    }
+  }
+
+  void clear_mounts() {
+    mounted_fs = std::make_shared<vfs::MountedFileSystem>();
+    mounts.clear();
+    mode = BrowserMode::SingleArchive;
+    current_mount_dir = "/";
+    clear_selection();
+  }
+
   /// @brief Attempt to open an archive. Updates status_msg on failure.
   void open(const std::string &path) {
     reader = std::make_shared<vfs::ArchiveReader>(); // fresh instance
+    clear_mounts();
     archive_open = false;
     archive_encrypted = false;
     refresh_requested = false;
@@ -213,8 +258,7 @@ struct AppState {
     password_verified = false;
     archive_path_str.clear();
     std::memset(prev_password, 0, sizeof(prev_password));
-    selected_entry.reset();
-    preview_data.clear();
+    clear_selection();
     drag_out_pending.clear();
     drag_out_temp_path.clear();
     root_dir.reset();
@@ -296,11 +340,89 @@ struct AppState {
     }
   }
 
+  void mount_archive_path(const std::string &path) {
+    if (!mounted_fs)
+      mounted_fs = std::make_shared<vfs::MountedFileSystem>();
+    vfs::MountedFileSystem::MountOptions opts;
+    opts.mount_point = "/";
+    opts.priority = static_cast<int>(mounts.size()) * 100;
+    opts.case_policy = vfs::PathCasePolicy::ArchiveExact;
+    opts.password = global_password;
+    auto result = mounted_fs->mount_archive(std::filesystem::path(path), opts);
+    if (!result) {
+      std::snprintf(status_msg, sizeof(status_msg),
+                    "Mount failed '%s' (error %d)", path.c_str(),
+                    static_cast<int>(result.error()));
+      return;
+    }
+    mode = BrowserMode::MountedNamespace;
+    archive_open = false;
+    current_mount_dir = "/";
+    clear_selection();
+    mounts.push_back({vfs::MountedFileSystem::MountSourceKind::Archive, path,
+                      opts.mount_point, opts.priority, opts.case_policy});
+    std::snprintf(status_msg, sizeof(status_msg), "Mounted archive: %s",
+                  path.c_str());
+  }
+
+  void mount_host_directory_path(const std::string &path) {
+    if (!mounted_fs)
+      mounted_fs = std::make_shared<vfs::MountedFileSystem>();
+    vfs::MountedFileSystem::MountOptions opts;
+    opts.mount_point = "/";
+    opts.priority = static_cast<int>(mounts.size()) * 100;
+    opts.case_policy = vfs::PathCasePolicy::HostNative;
+    auto result =
+        mounted_fs->mount_host_directory(std::filesystem::path(path), opts);
+    if (!result) {
+      std::snprintf(status_msg, sizeof(status_msg),
+                    "Mount failed '%s' (error %d)", path.c_str(),
+                    static_cast<int>(result.error()));
+      return;
+    }
+    mode = BrowserMode::MountedNamespace;
+    archive_open = false;
+    current_mount_dir = "/";
+    clear_selection();
+    mounts.push_back({vfs::MountedFileSystem::MountSourceKind::HostDirectory,
+                      path, opts.mount_point, opts.priority, opts.case_policy});
+    std::snprintf(status_msg, sizeof(status_msg), "Mounted folder: %s",
+                  path.c_str());
+  }
+
+  void rebuild_mounted_namespace_with_current_password() {
+    if (mode != BrowserMode::MountedNamespace)
+      return;
+
+    auto rebuilt = std::make_shared<vfs::MountedFileSystem>();
+    for (const auto &mount : mounts) {
+      vfs::MountedFileSystem::MountOptions opts;
+      opts.mount_point = mount.mount_point;
+      opts.priority = mount.priority;
+      opts.case_policy = mount.case_policy;
+      if (mount.kind == vfs::MountedFileSystem::MountSourceKind::Archive)
+        opts.password = global_password;
+
+      auto res = (mount.kind == vfs::MountedFileSystem::MountSourceKind::Archive)
+                     ? rebuilt->mount_archive(mount.source_root, opts)
+                     : rebuilt->mount_host_directory(mount.source_root, opts);
+      if (!res) {
+        std::snprintf(status_msg, sizeof(status_msg),
+                      "Mounted namespace refresh failed (error %d)",
+                      static_cast<int>(res.error()));
+        return;
+      }
+    }
+    mounted_fs = std::move(rebuilt);
+    if (selected_mounted_entry)
+      load_mounted_preview(*selected_mounted_entry);
+  }
+
   /// @brief Load the selected entry's raw bytes into preview_data.
   void load_preview(const vfs::ArchiveReader::FileEntry &entry) {
+    selected_mounted_entry.reset();
     selected_entry = entry;
     preview_data.clear();
-
     if (preview_texture) {
       glDeleteTextures(1, &preview_texture);
       preview_texture = 0;
@@ -338,6 +460,52 @@ struct AppState {
     } else if (res.error() == vfs::ErrorCode::DecryptionFailed) {
       std::string msg = "Access Denied (Decryption Failed): Enter correct "
                         "password in the top bar.";
+      preview_data.assign(msg.begin(), msg.end());
+      preview_data.push_back('\0');
+    }
+  }
+
+  void load_mounted_preview(const vfs::MountedFileSystem::MountedEntry &entry) {
+    selected_entry.reset();
+    selected_mounted_entry = entry;
+    preview_data.clear();
+    if (preview_texture) {
+      glDeleteTextures(1, &preview_texture);
+      preview_texture = 0;
+    }
+
+    if (entry.is_directory)
+      return;
+
+    auto res = mounted_fs->read_file_data(entry.virtual_path);
+    if (res) {
+      preview_data = std::move(res.value());
+      std::string ext =
+          std::filesystem::path(entry.virtual_path).extension().string();
+      std::transform(ext.begin(), ext.end(), ext.begin(),
+                     [](unsigned char c) { return std::tolower(c); });
+      if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".bmp") {
+        int channels = 0;
+        unsigned char *img = stbi_load_from_memory(
+            reinterpret_cast<const stbi_uc *>(preview_data.data()),
+            static_cast<int>(preview_data.size()), &preview_width,
+            &preview_height, &channels, 4);
+        if (img) {
+          glGenTextures(1, &preview_texture);
+          glBindTexture(GL_TEXTURE_2D, preview_texture);
+          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+          glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, preview_width, preview_height,
+                       0, GL_RGBA, GL_UNSIGNED_BYTE, img);
+          stbi_image_free(img);
+        }
+      }
+      preview_data.push_back('\0');
+    } else if (res.error() == vfs::ErrorCode::DecryptionFailed) {
+      std::string msg = "Access Denied (Decryption Failed): update the mounted "
+                        "archive password in the top bar.";
       preview_data.assign(msg.begin(), msg.end());
       preview_data.push_back('\0');
     }
@@ -402,6 +570,32 @@ static bool render_menu_bar(AppState &state, bool &show_hex) {
     if (ImGui::BeginMenu("File")) {
       if (ImGui::MenuItem("Open Archive...", "Ctrl+O"))
         state.open_dialog_requested = true;
+      if (ImGui::MenuItem("Mount Archive...")) {
+#ifdef _WIN32
+        const std::wstring selected = Win32OpenArchiveDialog();
+        if (!selected.empty())
+          state.mount_archive_path(narrow_from_wide(selected));
+#else
+        std::snprintf(state.status_msg, sizeof(state.status_msg),
+                      "Native file dialog is only implemented on Windows.");
+#endif
+      }
+      if (ImGui::MenuItem("Mount Host Directory...")) {
+#ifdef _WIN32
+        const std::wstring selected = Win32OpenFolderDialog();
+        if (!selected.empty())
+          state.mount_host_directory_path(narrow_from_wide(selected));
+#else
+        std::snprintf(state.status_msg, sizeof(state.status_msg),
+                      "Native folder dialog is only implemented on Windows.");
+#endif
+      }
+      if (state.mode == BrowserMode::MountedNamespace &&
+          ImGui::MenuItem("Clear Mounts")) {
+        state.clear_mounts();
+        std::snprintf(state.status_msg, sizeof(state.status_msg),
+                      "Cleared mounted namespace.");
+      }
       if (state.archive_open && ImGui::MenuItem("Extract All...")) {
         auto out = std::filesystem::current_path() / "extracted";
         state.start_extract_all(out);
@@ -412,8 +606,7 @@ static bool render_menu_bar(AppState &state, bool &show_hex) {
         state.archive_encrypted = false;
         state.password_verified = false;
         state.archive_path_str.clear();
-        state.selected_entry.reset();
-        state.preview_data.clear();
+        state.clear_selection();
         state.drag_out_pending.clear();
         if (state.preview_texture) {
           glDeleteTextures(1, &state.preview_texture);
@@ -433,7 +626,7 @@ static bool render_menu_bar(AppState &state, bool &show_hex) {
       ImGui::MenuItem("Hex Viewer", nullptr, &show_hex);
       ImGui::EndMenu();
     }
-    if (state.archive_open) {
+    if (state.has_open_content()) {
       ImGui::Spacing();
       ImGui::Spacing();
 
@@ -450,7 +643,12 @@ static bool render_menu_bar(AppState &state, bool &show_hex) {
                                    ImGuiInputTextFlags_Password |
                                        ImGuiInputTextFlags_EnterReturnsTrue)) {
         state.password_verified = false;
-        if (state.archive_encrypted && state.global_password[0] != '\0') {
+        if (state.mode == BrowserMode::MountedNamespace) {
+          state.rebuild_mounted_namespace_with_current_password();
+          state.password_verified = state.global_password[0] != '\0';
+          std::snprintf(state.status_msg, sizeof(state.status_msg),
+                        "Mounted archive password updated.");
+        } else if (state.archive_encrypted && state.global_password[0] != '\0') {
           for (const auto &e : state.reader->get_entries()) {
             if (vfs::cde_cipher_id(e.flags) != vfs::CipherAlgorithm::None) {
               auto res =
@@ -473,8 +671,13 @@ static bool render_menu_bar(AppState &state, bool &show_hex) {
       ImGui::SameLine(ImGui::GetWindowWidth() - avail);
       // Show the archive path, then an (Encrypted)/(Decrypted) tag if the
       // archive contains any ciphered entries.
-      ImGui::TextDisabled("%s", state.archive_path_str.c_str());
-      if (state.archive_encrypted) {
+      if (state.mode == BrowserMode::MountedNamespace) {
+        ImGui::TextDisabled("Mounted Namespace (%zu mounts)",
+                            state.mounts.size());
+      } else {
+        ImGui::TextDisabled("%s", state.archive_path_str.c_str());
+      }
+      if (state.archive_open && state.archive_encrypted) {
         ImGui::SameLine(0.f, 6.f);
         if (state.password_verified) {
           ImGui::PushStyleColor(ImGuiCol_Text,
@@ -494,6 +697,145 @@ static bool render_menu_bar(AppState &state, bool &show_hex) {
   return quit;
 }
 
+static void render_mounts_panel(AppState &state) {
+  if (state.mode != BrowserMode::MountedNamespace)
+    return;
+
+  ImGui::Begin("Mounts");
+  if (state.mounts.empty()) {
+    ImGui::TextDisabled("No mounts.");
+    ImGui::End();
+    return;
+  }
+
+  for (const auto &mount : state.mounts) {
+    ImGui::SeparatorText(
+        mount.kind == vfs::MountedFileSystem::MountSourceKind::Archive
+            ? "Archive"
+            : "Host Directory");
+    ImGui::TextWrapped("%s", mount.source_root.string().c_str());
+    ImGui::Text("Mount: %s", mount.mount_point.c_str());
+    ImGui::Text("Priority: %d", mount.priority);
+    ImGui::Text("Case: %d", static_cast<int>(mount.case_policy));
+  }
+  ImGui::End();
+}
+
+static void render_mounted_explorer(AppState &state) {
+  if (!state.mounted_fs)
+    return;
+
+  const auto list_res = state.mounted_fs->list_directory(state.current_mount_dir);
+  if (!list_res) {
+    ImGui::TextDisabled("Failed to list mounted directory.");
+    return;
+  }
+
+  std::vector<std::string> crumbs;
+  if (state.current_mount_dir == "/") {
+    crumbs.push_back("/");
+  } else {
+    std::string cur = state.current_mount_dir;
+    std::vector<std::string> parts;
+    std::size_t start = 1;
+    while (start < cur.size()) {
+      const std::size_t slash = cur.find('/', start);
+      if (slash == std::string::npos) {
+        parts.push_back(cur.substr(0));
+        break;
+      }
+      parts.push_back(cur.substr(0, slash));
+      start = slash + 1;
+    }
+    crumbs.push_back("/");
+    for (const auto &part : parts)
+      crumbs.push_back(part);
+  }
+
+  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(2, 4));
+  for (size_t i = 0; i < crumbs.size(); ++i) {
+    if (i > 0) {
+      ImGui::SameLine();
+      ImGui::TextDisabled("/");
+      ImGui::SameLine();
+    }
+    const std::string label = (i == 0) ? "Root" : crumbs[i].substr(crumbs[i].find_last_of('/') + 1);
+    if (ImGui::SmallButton(label.c_str())) {
+      state.current_mount_dir = crumbs[i];
+    }
+  }
+  ImGui::PopStyleVar();
+  ImGui::Separator();
+
+  if (ImGui::BeginTable("##mounted_entries", 4,
+                        ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                            ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY)) {
+    ImGui::TableSetupColumn("Name");
+    ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 90.f);
+    ImGui::TableSetupColumn("Source", ImGuiTableColumnFlags_WidthFixed, 120.f);
+    ImGui::TableSetupColumn("Priority", ImGuiTableColumnFlags_WidthFixed, 70.f);
+    ImGui::TableHeadersRow();
+
+    if (state.current_mount_dir != "/") {
+      ImGui::TableNextRow();
+      ImGui::TableSetColumnIndex(0);
+      if (ImGui::Selectable("[Folder] ..", false,
+                            ImGuiSelectableFlags_SpanAllColumns |
+                                ImGuiSelectableFlags_AllowDoubleClick)) {
+        const std::size_t slash = state.current_mount_dir.find_last_of('/');
+        state.current_mount_dir =
+            (slash == 0 || slash == std::string::npos)
+                ? "/"
+                : state.current_mount_dir.substr(0, slash);
+      }
+    }
+
+    const std::string filter(state.search_buf);
+    for (const auto &entry : list_res.value()) {
+      if (!filter.empty() && entry.virtual_path.find(filter) == std::string::npos)
+        continue;
+
+      ImGui::TableNextRow();
+      ImGui::TableSetColumnIndex(0);
+      std::string label =
+          (entry.is_directory ? "[Folder] " : "") + entry.display_name;
+      const bool selected = state.selected_mounted_entry.has_value() &&
+                            state.selected_mounted_entry->virtual_path ==
+                                entry.virtual_path;
+      if (ImGui::Selectable(label.c_str(), selected,
+                            ImGuiSelectableFlags_SpanAllColumns |
+                                ImGuiSelectableFlags_AllowDoubleClick)) {
+        if (entry.is_directory && ImGui::IsMouseDoubleClicked(0)) {
+          state.current_mount_dir = entry.virtual_path;
+        } else {
+          state.load_mounted_preview(entry);
+        }
+      }
+      if (!entry.is_directory && ImGui::BeginPopupContextItem()) {
+        if (ImGui::MenuItem("Copy Path"))
+          ImGui::SetClipboardText(entry.virtual_path.c_str());
+        if (ImGui::MenuItem("Extract to CWD")) {
+          const std::filesystem::path out_path =
+              std::filesystem::current_path() /
+              std::filesystem::path(entry.virtual_path).filename();
+          auto res = state.mounted_fs->extract_file(entry.virtual_path, out_path);
+          std::snprintf(state.status_msg, sizeof(state.status_msg), "%s",
+                        res ? "Extracted mounted file." : "Mounted extract failed.");
+        }
+        ImGui::EndPopup();
+      }
+
+      ImGui::TableSetColumnIndex(1);
+      ImGui::TextUnformatted(entry.is_directory ? "-" : format_size(entry.size).c_str());
+      ImGui::TableSetColumnIndex(2);
+      ImGui::TextUnformatted(entry.source_root.filename().string().c_str());
+      ImGui::TableSetColumnIndex(3);
+      ImGui::Text("%d", entry.priority);
+    }
+    ImGui::EndTable();
+  }
+}
+
 /// @brief Renders the sortable Archive Explorer table with search, right-click
 ///        context menu, and per-row selection.
 static void render_explorer(AppState &state) {
@@ -503,6 +845,13 @@ static void render_explorer(AppState &state) {
   ImGui::InputTextWithHint("##search", "Search files...", state.search_buf,
                            sizeof(state.search_buf));
   ImGui::Separator();
+
+  if (state.mode == BrowserMode::MountedNamespace && state.mounted_fs &&
+      state.mounted_fs->is_mounted()) {
+    render_mounted_explorer(state);
+    ImGui::End();
+    return;
+  }
 
   if (!state.archive_open) {
     ImGui::TextDisabled(
@@ -831,21 +1180,42 @@ static void render_explorer(AppState &state) {
 static void render_details(AppState &state, bool show_hex) {
   ImGui::Begin("File Details");
 
-  if (!state.selected_entry) {
+  if (state.mode == BrowserMode::MountedNamespace) {
+    if (!state.selected_mounted_entry) {
+      ImGui::TextDisabled("Select a mounted file in the Explorer.");
+      ImGui::End();
+      return;
+    }
+
+    const auto &e = *state.selected_mounted_entry;
+    ImGui::Text("Path:           %s", e.virtual_path.c_str());
+    ImGui::Text("Source Root:    %s", e.source_root.string().c_str());
+    ImGui::Text("Source Path:    %s", e.source_path.c_str());
+    ImGui::Text("Priority:       %d", e.priority);
+    ImGui::Text("Kind:           %s",
+                e.is_directory
+                    ? "Directory"
+                    : (e.source_kind ==
+                               vfs::MountedFileSystem::MountSourceKind::Archive
+                           ? "Archive File"
+                           : "Host File"));
+    ImGui::Text("Uncompressed:   %s", format_size(e.size).c_str());
+    ImGui::Separator();
+  } else if (!state.selected_entry) {
     ImGui::TextDisabled("Select a file in the Explorer.");
     ImGui::End();
     return;
+  } else {
+    const auto &e = *state.selected_entry;
+    ImGui::Text("Path:           %s", e.path.c_str());
+    ImGui::Text("Uncompressed:   %s", format_size(e.size).c_str());
+    ImGui::Text("On Disk:        %s", format_size(e.compressed_size).c_str());
+    ImGui::Text("Archive Offset: 0x%llX",
+                static_cast<unsigned long long>(e.size_offset));
+    ImGui::Text("Compression:    %s",
+                vfs::cde_is_lz4(e.flags) ? "LZ4 Frame" : "None");
+    ImGui::Separator();
   }
-
-  const auto &e = *state.selected_entry;
-  ImGui::Text("Path:           %s", e.path.c_str());
-  ImGui::Text("Uncompressed:   %s", format_size(e.size).c_str());
-  ImGui::Text("On Disk:        %s", format_size(e.compressed_size).c_str());
-  ImGui::Text("Archive Offset: 0x%llX",
-              static_cast<unsigned long long>(e.size_offset));
-  ImGui::Text("Compression:    %s",
-              vfs::cde_is_lz4(e.flags) ? "LZ4 Frame" : "None");
-  ImGui::Separator();
 
   if (ImGui::BeginTabBar("##preview_tabs")) {
     if (state.preview_texture && ImGui::BeginTabItem("Image")) {
@@ -1034,7 +1404,13 @@ int main(int argc, char **argv) {
           SDL_free(event.drop.file);
           continue;
         }
-        if (state.archive_open && dropped_path.extension() != ".avv" &&
+        if (state.mode == BrowserMode::MountedNamespace &&
+            dropped_path.extension() == ".avv") {
+          state.mount_archive_path(event.drop.file);
+        } else if (state.mode == BrowserMode::MountedNamespace &&
+                   std::filesystem::is_directory(dropped_path)) {
+          state.mount_host_directory_path(event.drop.file);
+        } else if (state.archive_open && dropped_path.extension() != ".avv" &&
             std::filesystem::is_regular_file(dropped_path)) {
           vfs::ArchiveWriter writer;
           vfs::EncryptionOptions enc;
@@ -1114,6 +1490,8 @@ int main(int argc, char **argv) {
 
     if (state.archive_open) {
       state.reader->pump_callbacks();
+    } else if (state.mode == BrowserMode::MountedNamespace && state.mounted_fs) {
+      state.mounted_fs->pump_callbacks();
     }
 
     ImGui_ImplOpenGL3_NewFrame();
@@ -1159,6 +1537,7 @@ int main(int argc, char **argv) {
 
     render_explorer(state);
     render_details(state, show_hex);
+    render_mounts_panel(state);
 
     // ---- Extraction progress modal ----
     if (state.extracting.load() || ImGui::IsPopupOpen("Extracting")) {

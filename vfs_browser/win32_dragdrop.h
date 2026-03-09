@@ -222,4 +222,21 @@ inline std::wstring Win32OpenArchiveDialog(HWND owner = nullptr) {
   return std::wstring(file_buf);
 }
 
+inline std::wstring Win32OpenFolderDialog(HWND owner = nullptr) {
+  BROWSEINFOW bi{};
+  bi.hwndOwner = owner;
+  bi.lpszTitle = L"Select folder to mount";
+  bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_USENEWUI;
+  PIDLIST_ABSOLUTE pidl = SHBrowseForFolderW(&bi);
+  if (!pidl)
+    return L"";
+  wchar_t path_buf[MAX_PATH] = {};
+  if (!SHGetPathFromIDListW(pidl, path_buf)) {
+    CoTaskMemFree(pidl);
+    return L"";
+  }
+  CoTaskMemFree(pidl);
+  return std::wstring(path_buf);
+}
+
 #endif

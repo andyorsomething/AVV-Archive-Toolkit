@@ -10,6 +10,7 @@ The Virtual File Browser is an ImGui-based GUI for inspecting `.avv` archives wi
 - Image, text, and hex previews
 - Right-click actions for copy path, extract, and delete
 - Dockable layout with multi-viewport support
+- Mounted namespace mode for mixing archives and host directories
 
 ## Keyboard Shortcuts
 
@@ -60,3 +61,24 @@ vfs_browser.exe path/to/archive_dir.avv
 2. Extract: Right-click an entry, drag it out, or use `File -> Extract All`.
 3. Append: Navigate to a target folder in an AVV4 archive and drop a file into the window.
 4. Close: Use `File -> Close Archive` when you are done.
+
+## Mounted Namespace Mode
+
+The browser can also build a read-only merged namespace from multiple sources.
+
+Menu entries:
+
+- `File -> Mount Archive...`
+- `File -> Mount Host Directory...`
+- `File -> Clear Mounts`
+
+Mounted mode behavior:
+
+- shows a merged tree rooted at `/`
+- resolves exact-path conflicts by priority and mount order
+- shows active mounts in a `Mounts` panel
+- previews and extracts the winning file from the merged namespace
+- keeps single-archive open/edit workflows separate from mounted mode
+
+Mounted mode is read-only in this phase. Archive append/delete and drag-in
+mutation remain available only in single-archive mode.

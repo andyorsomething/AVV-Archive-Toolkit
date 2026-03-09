@@ -74,6 +74,9 @@
     <ClCompile Include="..\vfs_core\thread_pool.cpp" />
     <ClCompile Include="..\vfs_core\archive_writer.cpp" />
     <ClCompile Include="..\vfs_core\crypto_utils.cpp" />
+    <ClCompile Include="..\vfs_core\path_utils.cpp" />
+    <ClCompile Include="..\vfs_core\mounted_source.cpp" />
+    <ClCompile Include="..\vfs_core\mounted_file_system.cpp" />
     <ClCompile Include="..\third_party\lz4\lz4.c" />
     <ClCompile Include="..\third_party\lz4\lz4frame.c" />
     <ClCompile Include="..\third_party\lz4\lz4hc.c" />
@@ -86,6 +89,9 @@
     <ClInclude Include="..\vfs_core\archive_writer.h" />
     <ClInclude Include="..\vfs_core\crypto_utils.h" />
     <ClInclude Include="..\vfs_core\vfs_types.h" />
+    <ClInclude Include="..\vfs_core\path_utils.h" />
+    <ClInclude Include="..\vfs_core\mounted_source.h" />
+    <ClInclude Include="..\vfs_core\mounted_file_system.h" />
     <ClInclude Include="..\third_party\tiny-aes-c\aes.h" />
     <ClInclude Include="catch2\catch.hpp" />
   </ItemGroup>
